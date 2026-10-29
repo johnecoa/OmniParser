@@ -17,18 +17,39 @@ import cv2
 import numpy as np
 # %matplotlib inline
 from matplotlib import pyplot as plt
-import easyocr
-from paddleocr import PaddleOCR
-reader = easyocr.Reader(['en'])
-paddle_ocr = PaddleOCR(
-    lang='en',  # other lang also available
-    use_angle_cls=False,
-    use_gpu=False,  # using cuda will conflict with pytorch in the same process
-    show_log=False,
-    max_batch_size=1024,
-    use_dilation=True,  # improves accuracy
-    det_db_score_mode='slow',  # improves accuracy
-    rec_batch_num=1024)
+
+# --- OCR opcional: no se necesita para el flujo YOLO + Florence-2 ---
+try:
+    import easyocr
+    reader = easyocr.Reader(['en'])
+except Exception as _e:
+    print(f"⚠️ easyocr no disponible (se ignora): {_e}")
+    easyocr = None
+    reader = None
+
+try:
+    from paddleocr import PaddleOCR
+    # Intento con los argumentos de la versión 2.x
+    paddle_ocr = PaddleOCR(
+        lang='en',
+        use_angle_cls=False,
+        use_gpu=False,
+        show_log=False,
+        max_batch_size=1024,
+        det_db_score_mode='slow',
+        rec_batch_num=1024,
+    )
+except TypeError:
+    # Versión 3.x: solo acepta 'lang'
+    try:
+        paddle_ocr = PaddleOCR(lang='en')
+    except Exception as _e:
+        print(f"⚠️ PaddleOCR no disponible (se ignora): {_e}")
+        paddle_ocr = None
+except Exception as _e:
+    print(f"⚠️ PaddleOCR no disponible (se ignora): {_e}")
+    paddle_ocr = None
+
 import time
 import base64
 
@@ -511,7 +532,14 @@ def get_xywh_yolo(input):
     x, y, w, h = int(x), int(y), int(w), int(h)
     return x, y, w, h
 
-def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, output_bb_format='xywh', goal_filtering=None, easyocr_args=None, use_paddleocr=False):
+def check_ocr_box(image_source, display_img=True, output_bb_format='xywh', goal_filtering=None, easyocr_args=None, use_paddleocr=False):
+    # Guardas: si el motor pedido no está disponible, cambia al otro
+    if use_paddleocr and paddle_ocr is None:
+        print("⚠️ PaddleOCR no disponible, usando EasyOCR")
+        use_paddleocr = False
+    if not use_paddleocr and reader is None:
+        raise RuntimeError("Ni PaddleOCR ni EasyOCR están disponibles")
+
     if isinstance(image_source, str):
         image_source = Image.open(image_source)
     if image_source.mode == 'RGBA':

@@ -1,14 +1,19 @@
-weights/icon_caption_blip2
-weights/icon_caption_florence
-weights/icon_detect/
-weights/icon_detect_v1_5/
-weights/icon_detect_v1_5_2/
-weights/icon_detect_v3/
+weights/
 .gradio
 __pycache__/
 debug.ipynb
 util/__pycache__/
 index.html?linkid=2289031
 wget-log
-weights/icon_caption_florence_v2/
 omnitool/gradio/uploads/
+
+# Archivos locales de la automatización y capturas de pantalla
+coordenadas*.json
+temp_capture.png
+test.png
+test_result.json
+test_filtered.json
+READMEPLSSSS.md
+.env
+.env.*
+!.env.example
