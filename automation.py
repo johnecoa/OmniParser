@@ -38,6 +38,9 @@ SCROLL_MAX_INTENTOS = 5
 ASSIGNMENTS_SCROLL_AMOUNT = -3000
 ASSIGNMENTS_FOCUS_DELAY = 0.25
 ASSIGNMENTS_POST_SCROLL_DELAY = 0.25
+# Pausa tras aplicar una respuesta antes de pulsar Next, para que la página
+# registre la selección.
+ASSIGNMENTS_POST_ANSWER_DELAY = 0.4
 
 ULTIMA_CAPTURA = {'ancho': 0, 'alto': 0, 'offset': (0, 0), 'escala': 1.0}
 
@@ -479,9 +482,16 @@ def ejecutar_accion_automatica(accion):
 
 
 def ejecutar_accion_individual(accion):
+    """Ejecuta una acción.
+
+    Devuelve True si la acción se aplicó (o si es una acción de control sin
+    objetivo en pantalla). Devuelve False cuando era una acción de respuesta
+    pero no se pudo aplicar, por ejemplo porque el id no existe en la captura.
+    """
     tipo = accion['tipo']
 
     if tipo == 'C':
+        aplicada = True
         for eid in accion['ids']:
             el = _elem_por_id(eid)
             if el:
@@ -489,9 +499,12 @@ def ejecutar_accion_individual(accion):
                 print(f"🖱️ Click id={eid} → {el['center']} | {el['content'][:50]}")
                 time.sleep(0.1)
             else:
+                aplicada = False
                 print(f"❌ No existe id={eid}")
+        time.sleep(0.2)
+        return aplicada
 
-    elif tipo == 'W':
+    if tipo == 'W':
         el = _elem_por_id(accion['id'])
         if el:
             pyautogui.click(*el['center']); time.sleep(0.1)
@@ -499,10 +512,14 @@ def ejecutar_accion_individual(accion):
             if accion.get('enter'):
                 pyautogui.press('enter')
             print(f"⌨️ id={accion['id']} ← '{accion['texto']}'")
+            aplicada = True
         else:
             print(f"❌ No existe id={accion['id']}")
+            aplicada = False
+        time.sleep(0.2)
+        return aplicada
 
-    elif tipo == 'D':
+    if tipo == 'D':
         o = _elem_por_id(accion['id_origen'])
         d = _elem_por_id(accion['id_destino'])
         if o and d:
@@ -511,10 +528,14 @@ def ejecutar_accion_individual(accion):
             pyautogui.moveTo(*d['center'], duration=1)
             pyautogui.mouseUp()
             print(f"🔧 Drag {accion['id_origen']}→{accion['id_destino']}")
+            aplicada = True
         else:
             print("❌ Drag: faltan ids")
+            aplicada = False
+        time.sleep(0.2)
+        return aplicada
 
-    elif tipo == 'SELECT_OPTION':
+    if tipo == 'SELECT_OPTION':
         el = _elem_por_id(accion['id'])
         if el:
             # Al pegar la captura en el chatbot, el desplegable puede cerrarse.
@@ -524,10 +545,14 @@ def ejecutar_accion_individual(accion):
             pyautogui.write(accion['opcion'], interval=0.02)
             pyautogui.press('enter')
             print(f"🧾 Selección en desplegable id={accion['id']}: {accion['opcion']}")
+            aplicada = True
         else:
             print(f"❌ No existe id={accion['id']} para el desplegable")
+            aplicada = False
+        time.sleep(0.2)
+        return aplicada
 
-    elif tipo == 'K':
+    if tipo == 'K':
         p = accion['tecla'].split('+')
         if len(p) == 1:
             pyautogui.press(p[0])
@@ -564,6 +589,7 @@ def ejecutar_accion_individual(accion):
         pyautogui.click(*coordenadas['Next_Question']); time.sleep(0.1)
 
     time.sleep(0.2)
+    return True
 
 
 # ============================================================
@@ -790,6 +816,7 @@ def automatizacion_completa():
         n = 1
         reintentos_bloqueo = 0
         assignments_omitir_scroll_una_vez = False
+        acciones_fallidas = []
 
         while True:
             if FINISHED_FLAG:
@@ -860,6 +887,15 @@ def automatizacion_completa():
 
             # 3. Enviar al chatbot
             payload = build_payload(ELEMENTOS_ACTUALES, FLUJO_ACTUAL)
+            if acciones_fallidas:
+                ids_fallidos = ', '.join(
+                    sorted({str(i) for i in acciones_fallidas}))
+                payload += (
+                    f"\nCONTROL DEL SCRIPT: los ids {ids_fallidos} no existen en la "
+                    "captura actual; no los uses. Devuelve de nuevo la acción de "
+                    "respuesta usando solo ids visibles en la captura."
+                )
+                acciones_fallidas = []
             if DEBUG:
                 print(f"📤 Payload ({len(payload)} chars):")
                 print(payload[:500] + ("..." if len(payload) > 500 else ""))
@@ -884,6 +920,8 @@ def automatizacion_completa():
             if not accion:
                 print("❌ No se pudo parsear")
                 n += 1; continue
+            if DEBUG:
+                print(f"🧩 Acciones parseadas: {accion}")
 
             # 5b. Fallback: B:block_read sin C:id → scroll y reintentar (sin avanzar n)
             if (any(a['tipo'] == 'BLOCK_READ' for a in accion) and
@@ -900,10 +938,11 @@ def automatizacion_completa():
 
             # 6. Ejecutar
             if FLUJO_ACTUAL == 'ASSIGNMENTS':
-                # Un grupo completo de selecciones S se aplica de corrido.
+                # Reúne las acciones que responden la pregunta. Solo se avanza
+                # si todas se aplicaron de verdad sobre la captura actual.
                 if accion and all(a['tipo'] == 'SELECT_OPTION' for a in accion):
-                    for accion_seleccion in accion:
-                        ejecutar_accion_individual(accion_seleccion)
+                    # Un grupo completo de selecciones S se aplica de corrido.
+                    respuestas = accion
                     acciones_completadas = True
                 # También admite una respuesta seguida de B:question_done,
                 # por ejemplo C:67;B:question_done, como una secuencia única.
@@ -911,13 +950,30 @@ def automatizacion_completa():
                       and len(accion) > 1
                       and all(a['tipo'] in ('C', 'SELECT_OPTION', 'W', 'D')
                               for a in accion[:-1])):
-                    for accion_respuesta in accion[:-1]:
-                        ejecutar_accion_individual(accion_respuesta)
+                    respuestas = accion[:-1]
                     acciones_completadas = True
                 else:
+                    respuestas = []
                     acciones_completadas = False
 
                 if acciones_completadas:
+                    aplicadas = [ejecutar_accion_individual(a) for a in respuestas]
+                    fallidas = [a for a, ok in zip(respuestas, aplicadas) if not ok]
+                    if fallidas:
+                        ids = []
+                        for a in fallidas:
+                            if a.get('ids'):
+                                ids.extend(a['ids'])
+                            elif a.get('id') is not None:
+                                ids.append(a['id'])
+                            else:
+                                ids.extend([a.get('id_origen'), a.get('id_destino')])
+                        print("⚠️ No se avanza: la respuesta no se pudo aplicar "
+                              f"(ids inexistentes en la captura: {ids}).")
+                        acciones_fallidas.extend(ids)
+                        n += 1
+                        continue
+                    time.sleep(ASSIGNMENTS_POST_ANSWER_DELAY)
                     pasar_a_siguiente_pregunta()
                     n += 1
                     continue
@@ -932,7 +988,11 @@ def automatizacion_completa():
                 if accion_unica['tipo'] == 'C' and len(accion_unica['ids']) > 1:
                     accion_unica = {
                         'tipo': 'C', 'ids': [accion_unica['ids'][0]]}
-                ejecutar_accion_individual(accion_unica)
+                if not ejecutar_accion_individual(accion_unica):
+                    ids = accion_unica.get('ids') or [accion_unica.get('id')]
+                    print("⚠️ Acción no aplicada; se pedirá una nueva captura "
+                          f"(ids inexistentes: {ids}).")
+                    acciones_fallidas.extend(ids)
                 if FINISHED_FLAG:
                     break
                 if accion_unica['tipo'] == 'C':
