@@ -18,37 +18,58 @@ import numpy as np
 # %matplotlib inline
 from matplotlib import pyplot as plt
 
-# --- OCR opcional: no se necesita para el flujo YOLO + Florence-2 ---
-try:
-    import easyocr
-    reader = easyocr.Reader(['en'])
-except Exception as _e:
-    print(f"⚠️ easyocr no disponible (se ignora): {_e}")
-    easyocr = None
-    reader = None
+# Los motores OCR se cargan bajo demanda para no ocupar RAM si no se usan.
+easyocr = None
+reader = None
+paddle_ocr = None
+PADDLEOCR_API_VERSION = None
 
-try:
-    from paddleocr import PaddleOCR
-    # Intento con los argumentos de la versión 2.x
-    paddle_ocr = PaddleOCR(
-        lang='en',
-        use_angle_cls=False,
-        use_gpu=False,
-        show_log=False,
-        max_batch_size=1024,
-        det_db_score_mode='slow',
-        rec_batch_num=1024,
-    )
-except TypeError:
-    # Versión 3.x: solo acepta 'lang'
+
+def inicializar_easyocr():
+    global easyocr, reader
+    if reader is None:
+        import easyocr as easyocr_module
+        easyocr = easyocr_module
+        reader = easyocr.Reader(['en'])
+    return reader
+
+
+def inicializar_paddleocr():
+    """Inicializa PaddleOCR con los argumentos compatibles con su API instalada."""
+    global paddle_ocr, PADDLEOCR_API_VERSION
+    if paddle_ocr is not None:
+        return True
     try:
-        paddle_ocr = PaddleOCR(lang='en')
-    except Exception as _e:
-        print(f"⚠️ PaddleOCR no disponible (se ignora): {_e}")
+        import inspect
+        from paddleocr import PaddleOCR
+
+        parametros = inspect.signature(PaddleOCR).parameters
+        if 'use_doc_orientation_classify' in parametros:
+            # PaddleOCR 3.x: no hacen falta los clasificadores de orientación
+            # para capturas de pantalla y cargarlos añade tiempo y memoria.
+            paddle_ocr = PaddleOCR(
+                lang='en',
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                # Evita fallos de oneDNN/PIR vistos en algunas builds de
+                # PaddlePaddle 3.x sobre CPU. PaddleOCR usa CPU igualmente.
+                enable_mkldnn=False,
+            )
+            PADDLEOCR_API_VERSION = 3
+        else:
+            paddle_ocr = PaddleOCR(
+                lang='en', use_angle_cls=False, use_gpu=False,
+                show_log=False, rec_batch_num=2,
+            )
+            PADDLEOCR_API_VERSION = 2
+        print(f"✅ PaddleOCR API {PADDLEOCR_API_VERSION}.x lista")
+        return True
+    except Exception as e:
         paddle_ocr = None
-except Exception as _e:
-    print(f"⚠️ PaddleOCR no disponible (se ignora): {_e}")
-    paddle_ocr = None
+        PADDLEOCR_API_VERSION = None
+        print(f"❌ No se pudo iniciar PaddleOCR: {e}")
+        return False
 
 import time
 import base64
@@ -518,12 +539,24 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
 
 
 def get_xywh(input):
-    x, y, w, h = input[0][0], input[0][1], input[2][0] - input[0][0], input[2][1] - input[0][1]
+    # EasyOCR entrega polígonos (4x2); PaddleOCR puede entregar cajas xyxy
+    # planas (4,). Aceptar ambos formatos evita indexar un escalar como punto.
+    coords = np.asarray(input)
+    if coords.ndim == 1 and coords.size >= 4:
+        x, y, xp, yp = coords[:4]
+        w, h = xp - x, yp - y
+    else:
+        x, y = coords[0][0], coords[0][1]
+        w, h = coords[2][0] - x, coords[2][1] - y
     x, y, w, h = int(x), int(y), int(w), int(h)
     return x, y, w, h
 
 def get_xyxy(input):
-    x, y, xp, yp = input[0][0], input[0][1], input[2][0], input[2][1]
+    coords = np.asarray(input)
+    if coords.ndim == 1 and coords.size >= 4:
+        x, y, xp, yp = coords[:4]
+    else:
+        x, y, xp, yp = coords[0][0], coords[0][1], coords[2][0], coords[2][1]
     x, y, xp, yp = int(x), int(y), int(xp), int(yp)
     return x, y, xp, yp
 
@@ -533,28 +566,70 @@ def get_xywh_yolo(input):
     return x, y, w, h
 
 def check_ocr_box(image_source, display_img=True, output_bb_format='xywh', goal_filtering=None, easyocr_args=None, use_paddleocr=False):
-    # Guardas: si el motor pedido no está disponible, cambia al otro
-    if use_paddleocr and paddle_ocr is None:
-        print("⚠️ PaddleOCR no disponible, usando EasyOCR")
-        use_paddleocr = False
-    if not use_paddleocr and reader is None:
-        raise RuntimeError("Ni PaddleOCR ni EasyOCR están disponibles")
+    if use_paddleocr:
+        if paddle_ocr is None and not inicializar_paddleocr():
+            raise RuntimeError("PaddleOCR fue seleccionado, pero no se pudo inicializar")
+    elif reader is None:
+        inicializar_easyocr()
 
     if isinstance(image_source, str):
         image_source = Image.open(image_source)
-    if image_source.mode == 'RGBA':
-        # Convert RGBA to RGB to avoid alpha channel issues
-        image_source = image_source.convert('RGB')
-    image_np = np.array(image_source)
-    w, h = image_source.size
+    if isinstance(image_source, np.ndarray):
+        image_np = image_source
+        h, w = image_np.shape[:2]
+    else:
+        if image_source.mode == 'RGBA':
+            # Convert RGBA to RGB to avoid alpha channel issues
+            image_source = image_source.convert('RGB')
+        image_np = np.array(image_source)
+        w, h = image_source.size
     if use_paddleocr:
-        if easyocr_args is None:
-            text_threshold = 0.5
+        text_threshold = (easyocr_args or {}).get('text_threshold', 0.5)
+        min_text_size = (easyocr_args or {}).get('min_size', 0)
+        if PADDLEOCR_API_VERSION >= 3:
+            results = paddle_ocr.predict(
+                image_np, text_rec_score_thresh=text_threshold)
+            coord, text = [], []
+            for item in results:
+                texts = item.get('rec_texts', [])
+                scores = item.get('rec_scores', [])
+                polygons = item.get('rec_polys', [])
+                boxes = item.get('rec_boxes', [])
+                for i, txt in enumerate(texts):
+                    score = float(scores[i]) if i < len(scores) else 1.0
+                    if score < text_threshold:
+                        continue
+                    if i < len(polygons):
+                        points = np.asarray(polygons[i])
+                        box = [points[:, 0].min(), points[:, 1].min(),
+                               points[:, 0].max(), points[:, 1].max()]
+                    elif i < len(boxes):
+                        box = boxes[i]
+                    else:
+                        continue
+                    if min_text_size:
+                        if (box[2] - box[0] < min_text_size
+                                or box[3] - box[1] < min_text_size):
+                            continue
+                    coord.append(box)
+                    text.append(txt)
         else:
-            text_threshold = easyocr_args['text_threshold']
-        result = paddle_ocr.ocr(image_np, cls=False)[0]
-        coord = [item[0] for item in result if item[1][1] > text_threshold]
-        text = [item[1][0] for item in result if item[1][1] > text_threshold]
+            raw_result = paddle_ocr.ocr(image_np, cls=False)
+            result = raw_result[0] if raw_result else []
+            filtered = []
+            for item in result or []:
+                if not item or item[1][1] < text_threshold:
+                    continue
+                puntos = np.asarray(item[0])
+                box = [puntos[:, 0].min(), puntos[:, 1].min(),
+                       puntos[:, 0].max(), puntos[:, 1].max()]
+                if min_text_size and (
+                        box[2] - box[0] < min_text_size
+                        or box[3] - box[1] < min_text_size):
+                    continue
+                filtered.append((box, item[1]))
+            coord = [item[0] for item in filtered]
+            text = [item[1][0] for item in filtered]
     else:  # EasyOCR
         if easyocr_args is None:
             easyocr_args = {}

@@ -10,10 +10,10 @@ omnitool/gradio/uploads/
 # Archivos locales de la automatización y capturas de pantalla
 coordenadas*.json
 temp_capture.png
+calibracion_*.png
 test.png
 test_result.json
 test_filtered.json
-READMEPLSSSS.md
 .env
 .env.*
 !.env.example

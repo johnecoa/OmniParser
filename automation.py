@@ -9,7 +9,12 @@ import pyperclip
 import random
 from PIL import ImageGrab, Image
 
-from detector import UIDetector
+from detector import (
+    DETECTION_PROFILES,
+    UIDetector,
+    guardar_thresholds,
+)
+from util.utils import inicializar_paddleocr
 
 # ============================================================
 # CONFIGURACIÓN
@@ -18,13 +23,21 @@ DEBUG = True
 CAPTURA_MODO = 'printscreen'
 CAPTURA_ESPERA_APERTURA = 1
 CAPTURA_ESPERA_POST_CLICK = 0.3
+ESPERA_POST_PEGADO_CHATBOT = 2.0
 VERIFICAR_CADA_N_PREGUNTAS = 3
 SCROLL_ANTES_PRIORIDAD = True
 SCROLL_ANTES_NEXT = True
 
+# SMARTBOOK usa prioridad; QUIZ avanza sin prioridad; ASSIGNMENTS
+# procesa una sola interacción por turno y vuelve a inspeccionar la pantalla.
+FLUJO_ACTUAL = 'SMARTBOOK'
+
 # Auto-scroll al detectar bloqueo
 SCROLL_PASO = -800
 SCROLL_MAX_INTENTOS = 5
+ASSIGNMENTS_SCROLL_AMOUNT = -3000
+ASSIGNMENTS_FOCUS_DELAY = 0.25
+ASSIGNMENTS_POST_SCROLL_DELAY = 0.25
 
 ULTIMA_CAPTURA = {'ancho': 0, 'alto': 0, 'offset': (0, 0), 'escala': 1.0}
 
@@ -32,9 +45,15 @@ coordenadas = {
     'High': None, 'Medium': None, 'Low': None,
     'PEGAR': None, 'ENVIAR': None, 'Next_Question': None,
     'ENFOCAR': None, 'INICIO': None, 'FINAL': None,
+    'QUIZ_SUBMIT': None,
 }
 
+COORDENADAS_BASE = ['PEGAR', 'ENVIAR', 'ENFOCAR', 'Next_Question', 'INICIO', 'FINAL']
+COORDENADAS_PRIORIDAD = ['High', 'Medium', 'Low']
+
 detector = None
+USAR_FLORENCE = False
+USAR_PADDLEOCR = True
 COORDENADAS_FILE = 'coordenadas_ui.json'
 ELEMENTOS_ACTUALES = []
 FINISHED_FLAG = False
@@ -93,6 +112,8 @@ def capturar_pantalla_snipping(activar_ventana=None, guardar_debug=True):
 
 
 def _copiar_imagen_a_portapapeles(img):
+    win32clipboard = None
+    clipboard_abierto = False
     try:
         import win32clipboard
         from io import BytesIO
@@ -101,12 +122,18 @@ def _copiar_imagen_a_portapapeles(img):
         data = buf.getvalue()[14:]
         buf.close()
         win32clipboard.OpenClipboard()
+        clipboard_abierto = True
         win32clipboard.EmptyClipboard()
         win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
-        win32clipboard.CloseClipboard()
         return True
     except Exception:
         return False
+    finally:
+        if clipboard_abierto:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
 
 
 def _registrar_captura(img):
@@ -137,6 +164,20 @@ def capturar_y_copiar_pantalla(activar_ventana=True):
         return False
 
 
+def capturar_pantalla_inmediata():
+    """Captura el monitor activo sin abrir Snipping ni hacer clics adicionales."""
+    try:
+        ox, oy, ancho, alto = _monitor_del_cursor()
+        imagen = ImageGrab.grab(
+            bbox=(ox, oy, ox + ancho, oy + alto), all_screens=True)
+        imagen.save('temp_capture.png')
+        _registrar_captura(imagen)
+        return True
+    except Exception as e:
+        print(f"❌ Error en captura inmediata: {e}")
+        return False
+
+
 # ============================================================
 # VALIDACIÓN DE COORDENADAS UI
 # ============================================================
@@ -156,10 +197,16 @@ def validar_coordenadas_completas():
     print("   (se guardan automáticamente en", COORDENADAS_FILE, ")")
     print("=" * 60)
 
-    for tipo in ['High', 'Medium', 'Low']:
-        coordenadas[tipo] = capturar_coordenada(
-            tipo, [f"Ve a la opción {tipo}", "Cursor encima"])
-        guardar_coordenadas_json()  # ← auto-save por si acaso
+    configurar_prioridad = input(
+        "¿Este cuestionario usa prioridad High/Medium/Low (SmartBook)? (s/n): "
+    ).strip().lower() == 's'
+    for tipo in COORDENADAS_PRIORIDAD:
+        if configurar_prioridad:
+            coordenadas[tipo] = capturar_coordenada(
+                tipo, [f"Ve a la opción {tipo}", "Cursor encima"])
+        else:
+            coordenadas[tipo] = None
+        guardar_coordenadas_json()
 
     for tipo, desc in [('PEGAR', 'campo para pegar en chatbot'),
                        ('ENVIAR', 'botón enviar')]:
@@ -182,6 +229,16 @@ def validar_coordenadas_completas():
         'FINAL', ["Ventana chatbot", "Esquina inf. der. de la respuesta"])
     guardar_coordenadas_json()
 
+    configurar_submit_quiz = input(
+        "¿Quieres guardar la coordenada del botón Submit de los quizzes? (s/n): "
+    ).strip().lower() == 's'
+    if configurar_submit_quiz:
+        coordenadas['QUIZ_SUBMIT'] = capturar_coordenada(
+            'QUIZ_SUBMIT', ["Pantalla del quiz", "Botón Submit de la parte superior"])
+    else:
+        coordenadas['QUIZ_SUBMIT'] = None
+    guardar_coordenadas_json()
+
     print("\n" + "=" * 60)
     print("🎯 RESUMEN:")
     for k, v in coordenadas.items():
@@ -200,8 +257,39 @@ def _elem_por_id(eid):
     return None
 
 
-def build_payload(elementos):
+def build_payload(elementos, flujo=None):
     lineas = []
+    flujo = flujo or FLUJO_ACTUAL
+    if flujo == 'SMARTBOOK':
+        nombre_flujo = 'SMARTBOOK (el script elige prioridad y pulsa Next)'
+        recordatorio = (
+            'RECORDATORIO SMARTBOOK: Resuelve usando el enunciado y el texto de las opciones. '
+            'No elijas prioridad ni pulses Next; el script gestiona ambos. '
+            'Si aparece un bloqueo de recurso, sigue las instrucciones de bloqueo del prompt.'
+        )
+    elif flujo == 'ASSIGNMENTS':
+        nombre_flujo = ('ASSIGNMENTS (interacción flexible; reanaliza después de cada paso; '
+                        'B:question_done avanza a Next)')
+        recordatorio = (
+            'RECORDATORIO ASSIGNMENTS: Usa el enunciado y las opciones del texto pegado para resolver. '
+            'Elige la acción adecuada para el tipo de respuesta (opciones, desplegable, input o arrastre). '
+            'Tras completar la pregunta, devuelve B:question_done para avanzar; si es la última, '
+            'devuelve B:finished. No deduzcas que es la última por una fracción aislada; '
+            'usa el indicador Part n of m. No uses Submit ni Confirm. Si un control revela opciones al abrirse, '
+            'pide una nueva captura antes de elegir.'
+        )
+    else:
+        nombre_flujo = ('QUIZ (sin prioridad: responde y pulsa Next; '
+                        'en la última pregunta usa Submit y confirma)')
+        recordatorio = (
+            'RECORDATORIO QUIZ: Resuelve usando el enunciado y el texto de las opciones. '
+            'No pulses prioridad ni Next; el script avanza después de responder. '
+            'Reserva Submit para la última pregunta o una pantalla explícita de entrega; '
+            'confirma solo desde una pantalla de confirmación.'
+        )
+    lineas.append(f'MODO DE CUESTIONARIO: {nombre_flujo}')
+    lineas.append(recordatorio)
+    lineas.append('Elementos detectados:')
     for el in elementos:
         txt = el['content'][:120] if el['content'] else f"({el['type']})"
         lineas.append(f"[{el['id']}] {el['type']}: {txt}")
@@ -225,6 +313,45 @@ def _contiene_bloqueo(elementos):
     return any(ind in texto for ind in indicadores)
 
 
+def _contador_preguntas(elementos):
+    """Lee el indicador inferior 'actual of total', si el OCR lo detectó."""
+    import re
+
+    alto = ULTIMA_CAPTURA.get('alto', 0)
+    textos = [
+        e for e in elementos
+        if e.get('type') == 'text'
+        and (not alto or e.get('center', [0, 0])[1] >= alto * 0.86)
+    ]
+    textos.sort(key=lambda e: (e.get('center', [0, 0])[1], e['bbox'][0]))
+    candidatos = [e.get('content', '') for e in textos]
+    for contenido in candidatos + [' '.join(candidatos)]:
+        coincidencia = re.search(
+            r'(?<!\d)(\d{1,3})\s*(?:of|0f|/)\s*(\d{1,3})(?!\d)',
+            contenido, re.IGNORECASE)
+        if coincidencia:
+            return int(coincidencia.group(1)), int(coincidencia.group(2))
+    return None
+
+
+def _progreso_assignment(elementos):
+    """Lee 'Part n of m' en cualquier zona de la pantalla, no solo el pie."""
+    import re
+
+    for elemento in elementos:
+        if elemento.get('type') != 'text':
+            continue
+        texto = elemento.get('content', '') or ''
+        coincidencia = re.search(
+            r'\bpart\s+(\d{1,3})\s*(?:of|0f|/)\s*(\d{1,3})\b',
+            texto, re.IGNORECASE)
+        if coincidencia:
+            actual, total = map(int, coincidencia.groups())
+            if 1 <= actual <= total:
+                return actual, total
+    return None
+
+
 def _tiene_read_about(elementos):
     """¿Está visible el botón 'Read about the concept'?"""
     for el in elementos:
@@ -232,6 +359,11 @@ def _tiene_read_about(elementos):
         if 'read about the concept' in txt:
             return True
     return False
+
+
+def _perfil_detector():
+    """Elige un perfil distinto sin tocar los umbrales históricos de SmartBook."""
+    return 'SMARTBOOK' if FLUJO_ACTUAL == 'SMARTBOOK' else 'QUIZ'
 
 
 def _scroll_y_re_detectar(elementos, max_intentos=SCROLL_MAX_INTENTOS):
@@ -244,11 +376,18 @@ def _scroll_y_re_detectar(elementos, max_intentos=SCROLL_MAX_INTENTOS):
             print(f"   ✅ 'Read about the concept' visible (intento {i})")
             return True, elementos
         print(f"   ⬇️ Scroll {i+1}/{max_intentos} buscando 'Read about the concept'")
-        pyautogui.click(*coordenadas['ENFOCAR']); time.sleep(0.1)
+        if FLUJO_ACTUAL != 'ASSIGNMENTS':
+            pyautogui.click(*coordenadas['ENFOCAR']); time.sleep(0.1)
         pyautogui.scroll(SCROLL_PASO); time.sleep(0.1)
-        if not capturar_y_copiar_pantalla(activar_ventana=False):
+        capturada = (
+            capturar_pantalla_inmediata()
+            if FLUJO_ACTUAL == 'ASSIGNMENTS'
+            else capturar_y_copiar_pantalla(activar_ventana=False)
+        )
+        if not capturada:
             return False, elementos
-        elementos = detector.detect('temp_capture.png')
+        elementos = detector.detect(
+            'temp_capture.png', profile=_perfil_detector())
         print(f"      {len(elementos)} elementos tras scroll")
     # último chequeo
     return _tiene_read_about(elementos), elementos
@@ -280,6 +419,21 @@ def procesar_mensaje_chatbot(mensaje):
             acciones.append({'tipo': 'SCROLL'}); continue
         if up.startswith('B:FINISHED') or up.startswith('B:END'):
             acciones.append({'tipo': 'FINISHED'}); continue
+        if up.startswith('B:QUESTION_DONE'):
+            acciones.append({'tipo': 'QUESTION_DONE'}); continue
+
+        if up == 'B:SUBMIT' or up.startswith('B:SUBMIT:') or up.startswith('B:CONFIRM:'):
+            tipo = 'SUBMIT' if up.startswith('B:SUBMIT') else 'CONFIRM'
+            partes = bruto.split(':', 2)
+            accion_envio = {'tipo': tipo}
+            if len(partes) == 3:
+                try:
+                    accion_envio['id'] = int(partes[2].strip())
+                except Exception:
+                    print(f"⚠️ Acción de envío inválida: {bruto}")
+                    continue
+            acciones.append(accion_envio)
+            continue
 
         if up.startswith('K:'):
             acciones.append({'tipo': 'K', 'tecla': bruto[2:].strip()}); continue
@@ -292,6 +446,19 @@ def procesar_mensaje_chatbot(mensaje):
                                  'id_destino': int(b.strip())})
             except Exception:
                 print(f"⚠️ D inválida: {bruto}")
+            continue
+
+        if up.startswith('S:'):
+            try:
+                id_str, opcion = bruto[2:].split(':', 1)
+                opcion = opcion.strip()
+                if not opcion:
+                    raise ValueError
+                acciones.append({'tipo': 'SELECT_OPTION',
+                                 'id': int(id_str.strip()),
+                                 'opcion': opcion})
+            except Exception:
+                print(f"⚠️ S inválida: {bruto}")
             continue
 
         if up.startswith('W!:') or up.startswith('W:'):
@@ -368,6 +535,19 @@ def ejecutar_accion_individual(accion):
         else:
             print("❌ Drag: faltan ids")
 
+    elif tipo == 'SELECT_OPTION':
+        el = _elem_por_id(accion['id'])
+        if el:
+            # Al pegar la captura en el chatbot, el desplegable puede cerrarse.
+            # Reabrirlo y elegir por texto evita depender de IDs efímeros del menú.
+            pyautogui.click(*el['center'])
+            time.sleep(0.15)
+            pyautogui.write(accion['opcion'], interval=0.02)
+            pyautogui.press('enter')
+            print(f"🧾 Selección en desplegable id={accion['id']}: {accion['opcion']}")
+        else:
+            print(f"❌ No existe id={accion['id']} para el desplegable")
+
     elif tipo == 'K':
         p = accion['tecla'].split('+')
         if len(p) == 1:
@@ -375,6 +555,20 @@ def ejecutar_accion_individual(accion):
         else:
             pyautogui.hotkey(*p)
         print(f"⌨️ Tecla '{accion['tecla']}'")
+
+    elif tipo in ('SUBMIT', 'CONFIRM'):
+        if tipo == 'SUBMIT' and coordenadas.get('QUIZ_SUBMIT'):
+            pyautogui.click(*coordenadas['QUIZ_SUBMIT'])
+            print(f"📨 Click Submit (coordenada QUIZ_SUBMIT) → {coordenadas['QUIZ_SUBMIT']}")
+        elif accion.get('id') is not None and (el := _elem_por_id(accion['id'])):
+            pyautogui.click(*el['center'])
+            etiqueta = 'Submit' if tipo == 'SUBMIT' else 'confirmación'
+            print(f"📨 Click {etiqueta} id={accion['id']} → {el['content'][:60]}")
+        else:
+            print(f"❌ Falta coordenada QUIZ_SUBMIT o un ID válido para {tipo}")
+
+    elif tipo == 'QUESTION_DONE':
+        print("✅ El chatbot indica que la pregunta está completa")
 
     elif tipo == 'SCROLL':
         print("⬇️ SCROLL (solicitado por chatbot)")
@@ -411,14 +605,70 @@ def ejecutar_accion_individual(accion):
 # ============================================================
 # CHATBOT
 # ============================================================
-def pegar_captura_en_chatbot():
+def _anotar_captura_para_chatbot(imagen, elementos):
+    """Dibuja cajas e IDs grandes en una copia de la captura, sin tocar el original."""
+    from PIL import ImageDraw, ImageFont
+    from pathlib import Path
+    import os
+
+    anotada = imagen.copy().convert('RGB')
+    draw = ImageDraw.Draw(anotada)
+    font_size = max(16, min(24, round(anotada.width / 100)))
+    font_path = Path(os.environ.get('WINDIR', r'C:\Windows')) / 'Fonts' / 'arial.ttf'
     try:
+        font = ImageFont.truetype(str(font_path), font_size)
+    except OSError:
+        font = ImageFont.load_default()
+
+    border_width = max(2, round(font_size / 8))
+    margin = max(2, round(font_size / 7))
+    for elemento in elementos:
+        x1, y1, x2, y2 = (int(v) for v in elemento['bbox'])
+        es_texto = elemento.get('type') == 'text'
+        color = '#16a34a' if es_texto else '#ef2929'
+        draw.rectangle((x1, y1, x2, y2), outline=color, width=border_width)
+
+        # La lista pegada ya contiene el tipo; aquí basta el ID para evitar
+        # etiquetas anchas que tapen opciones cercanas.
+        etiqueta = str(elemento['id'])
+        caja_texto = draw.textbbox((0, 0), etiqueta, font=font)
+        ancho = caja_texto[2] - caja_texto[0]
+        alto = caja_texto[3] - caja_texto[1]
+        etiqueta_y = y1 - alto - margin * 2
+        if etiqueta_y < 0:
+            etiqueta_y = min(y1 + border_width, max(0, anotada.height - alto - margin * 2))
+        etiqueta_x = min(max(0, x1), max(0, anotada.width - ancho - margin * 2))
+        draw.rectangle(
+            (etiqueta_x, etiqueta_y, etiqueta_x + ancho + margin * 2,
+             etiqueta_y + alto + margin * 2), fill=color)
+        draw.text((etiqueta_x + margin, etiqueta_y + margin - caja_texto[1]),
+                  etiqueta, fill='white', font=font)
+    return anotada
+
+
+def pegar_contexto_en_chatbot(payload):
+    """Pega la captura anotada y el parseado de esa captura en el mismo mensaje."""
+    try:
+        with Image.open('temp_capture.png') as captura:
+            imagen = _anotar_captura_para_chatbot(
+                captura.convert('RGB'), ELEMENTOS_ACTUALES)
+        if not _copiar_imagen_a_portapapeles(imagen):
+            print("❌ No se pudo copiar la captura al portapapeles; no se envió el mensaje.")
+            print("   Comprueba que pywin32 esté instalado: pip install pywin32")
+            return False
+
         x, y = coordenadas['PEGAR']
         pyautogui.click(x, y); time.sleep(0.1)
         pyautogui.click(x, y); time.sleep(0.1)
-        pyautogui.hotkey('ctrl', 'v'); time.sleep(0.1)
+        pyautogui.hotkey('ctrl', 'v')  # Adjunta la captura
+        time.sleep(2.3)  # Da tiempo a la interfaz para procesar la imagen
+
+        pyperclip.copy(payload)
+        pyautogui.hotkey('ctrl', 'v')  # Añade el parseado al mismo mensaje
+        time.sleep(ESPERA_POST_PEGADO_CHATBOT)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"❌ Error al preparar captura y parseado para el chatbot: {e}")
         return False
 
 
@@ -497,8 +747,15 @@ def finalizar_pregunta():
 def automatizacion_completa():
     global ELEMENTOS_ACTUALES, FINISHED_FLAG
 
-    if not all(coordenadas.values()):
-        print("❌ Faltan coordenadas. Ejecuta validación primero.")
+    FINISHED_FLAG = False
+
+    requeridas = COORDENADAS_BASE + (
+        COORDENADAS_PRIORIDAD if FLUJO_ACTUAL == 'SMARTBOOK' else [])
+    if FLUJO_ACTUAL == 'QUIZ':
+        requeridas += ['QUIZ_SUBMIT']
+    faltantes = [k for k in requeridas if not coordenadas.get(k)]
+    if faltantes:
+        print(f"❌ Faltan coordenadas: {', '.join(faltantes)}. Ejecuta validación primero.")
         return
 
     print("\n" + "=" * 60)
@@ -508,6 +765,10 @@ def automatizacion_completa():
     try:
         n = 1
         reintentos_bloqueo = 0
+        assignments_omitir_scroll_una_vez = False
+        submit_temprano_bloqueado = False
+        submit_assignments_rechazado = False
+        finished_assignments_rechazado = False
 
         while True:
             if FINISHED_FLAG:
@@ -517,17 +778,41 @@ def automatizacion_completa():
             print(f"\n🔹 Iteración {n}")
             print("-" * 40)
 
-            # 1. Enfocar + capturar
-            pyautogui.click(*coordenadas['ENFOCAR']); time.sleep(0.1)
-            if not capturar_y_copiar_pantalla():
+            # 1. Enfocar + capturar. En Assignments no abrir Snipping ni
+            # hacer otro clic después del enfoque, para preservar overlays.
+            if FLUJO_ACTUAL == 'ASSIGNMENTS':
+                if assignments_omitir_scroll_una_vez:
+                    print("↕️ Se conserva abierto el desplegable para capturar sus opciones")
+                    assignments_omitir_scroll_una_vez = False
+                else:
+                    pyautogui.click(*coordenadas['ENFOCAR'])
+                    time.sleep(ASSIGNMENTS_FOCUS_DELAY)
+                    if SCROLL_ANTES_NEXT:
+                        pyautogui.scroll(ASSIGNMENTS_SCROLL_AMOUNT)
+                        time.sleep(ASSIGNMENTS_POST_SCROLL_DELAY)
+                        print(
+                            "↕️ Scroll grande de Assignments tras enfocar "
+                            f"({ASSIGNMENTS_SCROLL_AMOUNT})"
+                        )
+                captura_ok = capturar_pantalla_inmediata()
+            else:
+                pyautogui.click(*coordenadas['ENFOCAR'])
+                time.sleep(0.1)
+                captura_ok = capturar_y_copiar_pantalla()
+            if not captura_ok:
                 n += 1; continue
 
             # 2. Detectar elementos
             print("🔍 Detectando elementos...")
             try:
-                ELEMENTOS_ACTUALES = detector.detect('temp_capture.png')
+                ELEMENTOS_ACTUALES = detector.detect(
+                    'temp_capture.png', profile=_perfil_detector())
             except Exception as e:
                 print(f"❌ Error detector: {e}")
+                if USAR_PADDLEOCR:
+                    print("🛑 Se detiene la ejecución porque PaddleOCR falló; "
+                          "no se repetirá el mismo error en cada iteración.")
+                    break
                 n += 1; continue
             print(f"   {len(ELEMENTOS_ACTUALES)} elementos")
 
@@ -545,13 +830,39 @@ def automatizacion_completa():
                 print(f"   📋 {len(ELEMENTOS_ACTUALES)} elementos tras scroll")
 
             # 3. Enviar al chatbot
-            payload = build_payload(ELEMENTOS_ACTUALES)
+            payload = build_payload(ELEMENTOS_ACTUALES, FLUJO_ACTUAL)
+            if submit_temprano_bloqueado:
+                contador = _contador_preguntas(ELEMENTOS_ACTUALES)
+                if contador:
+                    payload += (
+                        f"\nCONTROL DEL SCRIPT: el contador indica {contador[0]} de {contador[1]}; "
+                        "no es la última pregunta. No devuelvas B:submit. "
+                        "Si esta pregunta está contestada, devuelve B:question_done."
+                    )
+                submit_temprano_bloqueado = False
+            if submit_assignments_rechazado:
+                payload += (
+                    "\nCONTROL DEL SCRIPT: en ASSIGNMENTS no se permite Submit ni Confirm. "
+                    "Si todas las preguntas están contestadas, devuelve B:finished para cerrar el programa."
+                )
+                submit_assignments_rechazado = False
+            if finished_assignments_rechazado:
+                progreso = _progreso_assignment(ELEMENTOS_ACTUALES)
+                payload += (
+                    f"\nCONTROL DEL SCRIPT: todavía estás en Part {progreso[0]} of {progreso[1]}. "
+                    "No devuelvas B:finished; responde la pregunta actual y usa B:question_done para avanzar."
+                ) if progreso else (
+                    "\nCONTROL DEL SCRIPT: B:finished fue prematuro. Continúa con las preguntas pendientes; "
+                    "usa B:question_done para avanzar y reserva B:finished para el final real."
+                )
+                finished_assignments_rechazado = False
             if DEBUG:
                 print(f"📤 Payload ({len(payload)} chars):")
                 print(payload[:500] + ("..." if len(payload) > 500 else ""))
 
-            pyperclip.copy(payload)
-            pegar_captura_en_chatbot()
+            if not pegar_contexto_en_chatbot(payload):
+                n += 1
+                continue
             time.sleep(0.1)
             enviar_pregunta_chatbot()
             print("⏳ Esperando respuesta...")
@@ -570,6 +881,42 @@ def automatizacion_completa():
                 print("❌ No se pudo parsear")
                 n += 1; continue
 
+            if (FLUJO_ACTUAL == 'ASSIGNMENTS'
+                    and any(a['tipo'] in ('SUBMIT', 'CONFIRM') for a in accion)):
+                print("🛑 Submit/Confirm ignorado: ASSIGNMENTS termina sin enviar el cuestionario.")
+                accion = [a for a in accion if a['tipo'] not in ('SUBMIT', 'CONFIRM')]
+                submit_assignments_rechazado = True
+                if not accion:
+                    n += 1
+                    continue
+
+            if FLUJO_ACTUAL == 'ASSIGNMENTS' and any(
+                    a['tipo'] == 'FINISHED' for a in accion):
+                progreso = _progreso_assignment(ELEMENTOS_ACTUALES)
+                if progreso and progreso[0] < progreso[1]:
+                    print(
+                        f"⚠️ B:finished prematuro: el parser ve Part {progreso[0]} "
+                        f"of {progreso[1]}. Se continuará con la pregunta actual."
+                    )
+                    accion = [
+                        ({'tipo': 'QUESTION_DONE'} if a['tipo'] == 'FINISHED' else a)
+                        for a in accion
+                    ]
+                    finished_assignments_rechazado = True
+
+            contador = _contador_preguntas(ELEMENTOS_ACTUALES)
+            if (FLUJO_ACTUAL == 'QUIZ' and contador
+                    and contador[0] < contador[1]
+                    and any(a['tipo'] == 'SUBMIT' for a in accion)):
+                print(
+                    f"🛑 Submit bloqueado: el contador indica {contador[0]} de "
+                    f"{contador[1]}, no la última pregunta.")
+                accion = [a for a in accion if a['tipo'] != 'SUBMIT']
+                submit_temprano_bloqueado = True
+                if not accion:
+                    n += 1
+                    continue
+
             # 5b. Fallback: B:block_read sin C:id → scroll y reintentar (sin avanzar n)
             if (any(a['tipo'] == 'BLOCK_READ' for a in accion) and
                     not any(a['tipo'] == 'C' for a in accion) and
@@ -584,6 +931,61 @@ def automatizacion_completa():
             reintentos_bloqueo = 0  # resetear tras éxito
 
             # 6. Ejecutar
+            if FLUJO_ACTUAL == 'ASSIGNMENTS':
+                # Un grupo completo de selecciones S se aplica de corrido.
+                if accion and all(a['tipo'] == 'SELECT_OPTION' for a in accion):
+                    for accion_seleccion in accion:
+                        ejecutar_accion_individual(accion_seleccion)
+                    acciones_completadas = True
+                # También admite una respuesta seguida de B:question_done,
+                # por ejemplo C:67;B:question_done, como una secuencia única.
+                elif (accion[-1]['tipo'] in ('QUESTION_DONE', 'FINISHED')
+                      and len(accion) > 1
+                      and all(a['tipo'] in ('C', 'SELECT_OPTION', 'W', 'D')
+                              for a in accion[:-1])):
+                    for accion_respuesta in accion[:-1]:
+                        ejecutar_accion_individual(accion_respuesta)
+                    acciones_completadas = True
+                else:
+                    acciones_completadas = False
+
+                if acciones_completadas:
+                    if accion[-1]['tipo'] == 'FINISHED':
+                        FINISHED_FLAG = True
+                        print("🏁 Todas las preguntas están completas; cerrando el programa sin Submit.")
+                        break
+                    pasar_a_siguiente_pregunta()
+                    n += 1
+                    continue
+
+                # Para cualquier otro tipo de acción, conserva el ciclo de
+                # una interacción y una captura.
+                accion_unica = accion[0]
+                if accion_unica['tipo'] == 'QUESTION_DONE':
+                    pasar_a_siguiente_pregunta()
+                    n += 1
+                    continue
+                if accion_unica['tipo'] == 'C' and len(accion_unica['ids']) > 1:
+                    accion_unica = {
+                        'tipo': 'C', 'ids': [accion_unica['ids'][0]]}
+                ejecutar_accion_individual(accion_unica)
+                if FINISHED_FLAG:
+                    break
+                if accion_unica['tipo'] == 'C':
+                    assignments_omitir_scroll_una_vez = any(
+                        'click to select' in (_elem_por_id(eid) or {}).get(
+                            'content', '').lower()
+                        for eid in accion_unica['ids']
+                    )
+                # La acción acaba de devolver el foco a la página del
+                # cuestionario; la próxima captura debe ser directa, sin
+                # un clic adicional en ENFOCAR que pueda cerrar un overlay.
+                if accion_unica['tipo'] == 'SKIP':
+                    n += 1
+                    continue
+                n += 1
+                continue
+
             ejecutar_accion_automatica(accion)
 
             # 7. Determinar flujo
@@ -599,6 +1001,16 @@ def automatizacion_completa():
                 if any(a['tipo'] == 'BLOCK_TO_Q' for a in accion):
                     time.sleep(0.1)
                     pasar_a_siguiente_pregunta()
+                n += 1
+                continue
+
+            if FLUJO_ACTUAL == 'QUIZ':
+                # Submit y confirmación ya se ejecutaron por ID detectado. No
+                # pulses Next después: espera la pantalla siguiente y su decisión.
+                if any(a['tipo'] in ('SUBMIT', 'CONFIRM') for a in accion):
+                    n += 1
+                    continue
+                pasar_a_siguiente_pregunta()
                 n += 1
                 continue
 
@@ -665,13 +1077,13 @@ def cargar_coordenadas_json():
         print(f"⚠️ No se pudo leer {COORDENADAS_FILE}: {e}")
         return False
 
-    faltantes = [k for k in coordenadas if not data.get(k)]
+    faltantes = [k for k in COORDENADAS_BASE if not data.get(k)]
     if faltantes:
         print(f"⚠️ {COORDENADAS_FILE} incompleto. Faltan: {faltantes}")
         return False
 
     for k in coordenadas:
-        v = data[k]
+        v = data.get(k)
         coordenadas[k] = tuple(v) if isinstance(v, list) else v
     return True
 
@@ -686,6 +1098,226 @@ def borrar_coordenadas_json():
         coordenadas[k] = None
 
 
+def configurar_detector(use_florence, use_paddleocr=True):
+    """Carga el detector si cambian Florence o el motor OCR."""
+    global detector, USAR_FLORENCE, USAR_PADDLEOCR
+
+    if (detector is not None
+            and detector.use_florence == use_florence
+            and detector.use_paddleocr == use_paddleocr):
+        USAR_FLORENCE = use_florence
+        USAR_PADDLEOCR = use_paddleocr
+        return True
+
+    if use_florence:
+        from pathlib import Path
+        carpeta = Path('weights/icon_caption_florence')
+        necesarios = ['config.json', 'generation_config.json', 'model.safetensors']
+        faltan = [nombre for nombre in necesarios if not (carpeta / nombre).is_file()]
+        if faltan:
+            print(f"❌ Faltan pesos de Florence-2 en {carpeta}: {', '.join(faltan)}")
+            print("   Consulta la sección Florence-2 opcional del README para descargarlos.")
+            return False
+
+    try:
+        extras = []
+        if use_florence:
+            extras.append('Florence-2')
+        if use_paddleocr:
+            extras.append('PaddleOCR')
+        print("🔄 Cargando detector" + (f" con {', '.join(extras)}..." if extras else "..."))
+        nuevo_detector = UIDetector(
+            use_florence=use_florence, use_paddleocr=use_paddleocr)
+    except Exception as e:
+        print(f"❌ No se pudo cargar el detector: {e}")
+        return False
+
+    detector = nuevo_detector
+    USAR_FLORENCE = use_florence
+    USAR_PADDLEOCR = use_paddleocr
+    print("✅ Detector listo")
+    return True
+
+
+def calibrar_threshold():
+    """Prueba thresholds YOLO/OCR de un perfil sobre una captura fija."""
+    import os
+    from PIL import ImageDraw
+
+    if not coordenadas.get('ENFOCAR'):
+        print("❌ Primero calibra las coordenadas UI (opción 1), incluido ENFOCAR.")
+        return
+    if detector is None and not configurar_detector(USAR_FLORENCE, USAR_PADDLEOCR):
+        return
+
+    print("\nPerfil a calibrar:")
+    print("1. SMARTBOOK (conserva su configuración independiente)")
+    print("2. QUIZ / ASSIGNMENTS (perfil de controles y navegación)")
+    seleccion = input("Elige 1 o 2: ").strip()
+    if seleccion not in ('1', '2'):
+        print("❌ Opción inválida")
+        return
+    perfil = 'SMARTBOOK' if seleccion == '1' else 'QUIZ'
+    print("\nParámetro a calibrar:")
+    print("1. box_threshold (cajas de controles YOLO; no modifica el texto verde)")
+    print("2. text_threshold (sensibilidad de detección de texto OCR)")
+    print("3. low_text (recupera texto débil; puede añadir ruido)")
+    print("4. link_threshold (cómo conecta regiones de texto cercanas)")
+    print("5. min_size (tamaño mínimo de texto; bájalo para títulos pequeños)")
+    print("6. x_gap_max (distancia horizontal para unir cajas; bájala para separar textos vecinos)")
+    parametro_seleccion = input("Elige 1-6: ").strip()
+    parametros = {
+        '1': ('box_threshold', 'YOLO'),
+        '2': ('text_threshold', 'OCR'),
+        '3': ('low_text', 'OCR'),
+        '4': ('link_threshold', 'OCR'),
+        '5': ('min_size', 'OCR_INT'),
+        '6': ('x_gap_max', 'MERGE_INT'),
+    }
+    if parametro_seleccion not in parametros:
+        print("❌ Opción inválida")
+        return
+    parametro, tipo_parametro = parametros[parametro_seleccion]
+    perfil_valores = (
+        'SMARTBOOK'
+        if perfil == 'QUIZ' and tipo_parametro in ('OCR', 'OCR_INT')
+        else perfil
+    )
+    perfil_guardado = perfil_valores
+    if perfil == 'QUIZ' and perfil_valores == 'SMARTBOOK':
+        print("ℹ️ Quiz y Assignments comparten los ajustes OCR de SmartBook.")
+
+    def leer_valor():
+        if tipo_parametro == 'YOLO':
+            return DETECTION_PROFILES[perfil][parametro]
+        if tipo_parametro == 'MERGE_INT':
+            return DETECTION_PROFILES[perfil][parametro]
+        return DETECTION_PROFILES[perfil_valores]['ocr'][parametro]
+
+    def escribir_valor(valor):
+        if tipo_parametro in ('YOLO', 'MERGE_INT'):
+            DETECTION_PROFILES[perfil][parametro] = valor
+        else:
+            DETECTION_PROFILES[perfil_valores]['ocr'][parametro] = valor
+
+    valor_guardado = leer_valor()
+
+    if not capturar_y_copiar_pantalla():
+        print("❌ No se pudo capturar la pantalla del cuestionario.")
+        return
+
+    from pathlib import Path
+    preview_dir = Path(__file__).resolve().parent
+    print("\nSe reutiliza esta captura para comparar thresholds.")
+    print("El parser y la vista previa se vuelven a generar para cada valor.")
+    print("En la vista previa, verde = texto OCR; rojo = controles YOLO.")
+
+    while True:
+        try:
+            elementos = detector.detect('temp_capture.png', profile=perfil)
+        except Exception as e:
+            escribir_valor(valor_guardado)
+            print(f"❌ Falló el parser: {e}")
+            return
+
+        preview_path = preview_dir / f"calibracion_{perfil.lower()}_{time.time_ns()}.png"
+        with Image.open('temp_capture.png') as captura:
+            preview = captura.convert('RGB')
+        draw = ImageDraw.Draw(preview)
+        for el in elementos:
+            x1, y1, x2, y2 = el['bbox']
+            color = '#e53935' if el['type'] != 'text' else '#1e8e3e'
+            draw.rectangle((x1, y1, x2, y2), outline=color, width=2)
+            draw.text((x1, max(0, y1 - 14)), f"{el['id']} {el['type']}", fill=color)
+        try:
+            preview.save(str(preview_path))
+            preview_ok = True
+        except OSError as e:
+            preview_ok = False
+            print(f"⚠️ No se pudo guardar la vista previa: {e}")
+
+        valor_actual = leer_valor()
+        print(f"\nPerfil {perfil} | {parametro}={valor_actual}")
+        if preview_ok:
+            print(f"Elementos detectados: {len(elementos)} | vista previa: {preview_path}")
+        else:
+            print(f"Elementos detectados: {len(elementos)} | compara la lista con la pantalla capturada")
+        for el in elementos:
+            contenido = el['content'][:100] if el['content'] else ''
+            print(f"[{el['id']}] {el['type']}: {contenido} | bbox={el['bbox']}")
+        if preview_ok:
+            try:
+                os.startfile(str(preview_path))
+            except Exception:
+                print("Abre la vista previa indicada arriba para revisar las cajas.")
+
+        opcion = input(
+            "\nThreshold numérico (0.03, 0.05, 0.10...) | [s] guardar | [r] recapturar | [v] abrir preview | [q] cancelar: "
+        ).strip().lower()
+        if opcion == 's':
+            if guardar_thresholds(perfil_guardado):
+                print(f"✅ Guardado {perfil_guardado}: {parametro}={valor_actual:.3f}")
+            return
+        if opcion == 'q':
+            escribir_valor(valor_guardado)
+            print("Calibración cancelada; se conservó el valor anterior.")
+            return
+        if opcion == 'v':
+            if not preview_ok:
+                print("No hay vista previa guardada para esta prueba.")
+            else:
+                try:
+                    os.startfile(str(preview_path))
+                except Exception as e:
+                    print(f"No se pudo abrir la vista previa: {e}")
+            continue
+        if opcion == 'r':
+            if not capturar_y_copiar_pantalla():
+                print("❌ No se pudo recapturar; continúa con la captura anterior.")
+            continue
+        try:
+            if tipo_parametro in ('OCR_INT', 'MERGE_INT'):
+                nuevo = int(opcion)
+                limite = (5, 100) if tipo_parametro == 'OCR_INT' else (0, 500)
+                if not limite[0] <= nuevo <= limite[1]:
+                    raise ValueError
+            else:
+                nuevo = float(opcion)
+                if not 0.0 <= nuevo <= 1.0 or (tipo_parametro == 'YOLO' and nuevo == 0.0):
+                    raise ValueError
+            escribir_valor(nuevo)
+        except ValueError:
+            if tipo_parametro == 'OCR_INT':
+                print("Escribe un entero entre 5 y 100, o elige s, r, v o q.")
+            elif tipo_parametro == 'MERGE_INT':
+                print("Escribe un entero entre 0 y 500 píxeles, o elige s, r, v o q.")
+            else:
+                print("Escribe un valor entre 0 y 1 (por ejemplo 0.04 o 0.75), o elige s, r, v o q.")
+
+
+def copiar_prompt_chatbot():
+    """Copia solo el bloque de prompt, sin la explicación ni el Markdown externo."""
+    from pathlib import Path
+    import re
+
+    ruta_prompt = Path(__file__).resolve().parent / 'PROMPT_CHATBOT.md'
+    try:
+        contenido = ruta_prompt.read_text(encoding='utf-8')
+        coincidencia = re.search(r'```text\s*\n(.*?)\n```', contenido, re.DOTALL)
+        if not coincidencia:
+            print("❌ No encontré el bloque de prompt delimitado por ```text en PROMPT_CHATBOT.md")
+            return
+        prompt = coincidencia.group(1).strip()
+        pyperclip.copy(prompt)
+        print(f"✅ Prompt copiado al portapapeles ({len(prompt)} caracteres).")
+        print("   Se copió solo el bloque de instrucciones, sin el resto del archivo.")
+        print("   Ya puedes pegarlo en el chatbot con Ctrl+V.")
+    except FileNotFoundError:
+        print(f"❌ No se encontró el archivo: {ruta_prompt}")
+    except Exception as e:
+        print(f"❌ No se pudo copiar el prompt: {e}")
+
+
 def mostrar_menu():
     print("\n" + "=" * 60)
     print("🎯 SISTEMA AUTOMATIZADO (IDs + auto-scroll)")
@@ -693,17 +1325,17 @@ def mostrar_menu():
     print("1. Validar coordenadas UI")
     print("2. Ejecutar automatización")
     print("3. Borrar coordenadas guardadas")
-    print("4. Salir")
+    print("4. Calibrar threshold del parser")
+    print("5. Copiar prompt del chatbot al portapapeles")
+    print("6. Salir")
     while True:
-        op = input("\nOpción (1-4): ").strip()
-        if op in '1234':
+        op = input("\nOpción (1-6): ").strip()
+        if op in '123456':
             return op
 
 def main():
-    global detector
-    print("🔄 Cargando detector (YOLO + EasyOCR)...")
-    detector = UIDetector()
-    print("✅ Detector listo\n")
+    global FLUJO_ACTUAL
+    print("El detector se carga al calibrar o iniciar una ejecución. Florence-2 es opcional y está desactivado por defecto.\n")
 
     # Intentar cargar coordenadas persistidas
     if cargar_coordenadas_json():
@@ -721,16 +1353,48 @@ def main():
             if input("   ¿Sobrescribir coordenadas actuales? (s/n): ").strip().lower() == 's':
                 validar_coordenadas_completas()
         elif op == '2':
-            if not all(coordenadas.values()):
-                print("❌ Faltan coordenadas. Usa la opción 1 primero.")
+            print("\nTipo de cuestionario:")
+            print("1. SmartBook (el script elige prioridad y pulsa Next)")
+            print("2. Quiz (Next y Submit al final)")
+            print("3. Assignments (interacción flexible y reanálisis por turno)")
+            tipo_flujo = input("Elige 1, 2 o 3: ").strip()
+            if tipo_flujo not in ('1', '2', '3'):
+                print("❌ Opción inválida")
                 continue
-            FINISHED_FLAG = True
+            FLUJO_ACTUAL = {
+                '1': 'SMARTBOOK',
+                '2': 'QUIZ',
+                '3': 'ASSIGNMENTS',
+            }[tipo_flujo]
+            requeridas = COORDENADAS_BASE + (
+                COORDENADAS_PRIORIDAD if FLUJO_ACTUAL == 'SMARTBOOK' else [])
+            faltantes = [k for k in requeridas if not coordenadas.get(k)]
+            if faltantes:
+                print(f"❌ Faltan coordenadas: {', '.join(faltantes)}. Usa la opción 1 primero.")
+                continue
+            usar_florence = input(
+                "¿Activar Florence-2 para clasificar controles ambiguos? (s/N): "
+            ).strip().lower() == 's'
+            respuesta_paddle = input(
+                "¿Usar PaddleOCR para leer texto? (S/n, predeterminado: sí): "
+            ).strip().lower()
+            usar_paddleocr = respuesta_paddle not in ('n', 'no')
+            if usar_paddleocr and not inicializar_paddleocr():
+                continue
+            if not configurar_detector(usar_florence, usar_paddleocr):
+                continue
             print("\n🚀 Iniciando en 3s...")
             time.sleep(3)
             automatizacion_completa()
+            if FINISHED_FLAG:
+                print(f"✅ Ejecución de {FLUJO_ACTUAL} finalizada; regreso al menú.")
         elif op == '3':
             borrar_coordenadas_json()
+        elif op == '5':
+            copiar_prompt_chatbot()
         elif op == '4':
+            calibrar_threshold()
+        elif op == '6':
             print("👋 ¡Hasta luego!")
             break
 

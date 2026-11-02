@@ -1,0 +1,12 @@
+{
+  "QUIZ": {
+    "box_threshold": 0.03,
+    "ocr": {
+      "text_threshold": 0.3,
+      "low_text": 0.35,
+      "link_threshold": 0.8,
+      "min_size": 10
+    },
+    "x_gap_max": 50
+  }
+}
