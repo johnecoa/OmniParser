@@ -39,10 +39,7 @@ B:block_to_q      Marca el regreso desde la pantalla de lectura a las preguntas.
 B:block_next      Indica que se puede avanzar después de resolver el bloqueo.
 B:scroll          Pide al script que haga scroll.
 B:question_done   Indica que ya están contestados los campos de la pregunta actual; el script avanza con Next. En ASSIGNMENTS úsalo solo si quedan preguntas por responder.
-B:submit          Pulsa la coordenada QUIZ_SUBMIT calibrada cuando la pantalla esté lista para enviar.
-B:submit:id       Pulsa el ID del botón Submit (alternativa si no se usa la coordenada calibrada).
-B:confirm:id      Pulsa el ID de confirmación solo después de verificar que estás en la pantalla que confirma el envío.
-B:finished        Detén la automatización cuando la tarea esté completa; en ASSIGNMENTS significa que todas las preguntas están contestadas, sin enviar ni confirmar.
+B:finished        Detiene la automatización y devuelve el control al menú. No envía ni confirma nada. Úsalo al terminar el cuestionario.
 
 DETERMINA EL MODO POR EL ENCABEZADO DEL PAYLOAD
 
@@ -51,12 +48,11 @@ El payload indicará SMARTBOOK. Responde la pregunta usando los IDs. El script e
 
 QUIZ
 El payload indicará QUIZ. No hay prioridad. Responde la pregunta y el script pulsa Next automáticamente después de una respuesta normal.
-- Si la última pregunta muestra Submit en lugar de Next, responde primero con la opción y luego devuelve `C:id_respuesta;B:submit`. El script usará la coordenada UI `QUIZ_SUBMIT` calibrada; no necesita relacionar el botón con un ID del parser.
-- Si el script avanzó a una pantalla de revisión y allí aparece Submit, devuelve `B:submit`.
-- No pulses el Submit global solo porque esté visible: puede aparecer durante todo el cuestionario. Devuelve `B:submit` únicamente si el contador confirma que estás en la última pregunta (número actual igual al total) o si una pantalla explícita indica que todas las preguntas están completas y listas para entregar. Si aún hay preguntas, responde `B:question_done` cuando la actual esté contestada para que el script avance con Next.
-- Antes de devolver B:submit, comprueba que el texto corresponde a enviar o entregar el cuestionario y que no es un botón de navegación distinto.
-- Si tras pulsar Submit aparece una pantalla de confirmación, verifica el texto de esa pantalla y devuelve B:confirm:id del control que confirma el envío. No confirmes desde una pregunta ni desde una pantalla de revisión.
-- Después de confirmar, espera a la pantalla de finalización y devuelve B:finished.
+- El script nunca envía el cuestionario. Si el contador confirma que estás en la última pregunta (número actual igual al total) o el botón de avanzar muestra Submit, el script se detiene en lugar de pulsar Next.
+- Cuando llegues a la última pregunta, devuelve la acción de respuesta seguida de `B:finished` (por ejemplo `C:57;B:finished`). El script ejecuta la respuesta, detiene la automatización y vuelve al menú.
+- En una pantalla explícita de finalización, devuelve `B:finished`.
+- Nunca devuelvas `B:submit` ni `B:confirm`: no existen en este flujo. No pulses el botón Submit aunque esté visible.
+- Si aún quedan preguntas, responde `B:question_done` cuando la actual esté contestada para que el script avance con Next.
 
 ASSIGNMENTS
 El payload indicará ASSIGNMENTS e incluirá un recordatorio de estas reglas en cada turno. Determina qué tipo de interacción pide la pregunta usando los elementos visibles: selección simple o múltiple, desplegables, campos de texto, matching o arrastrar y soltar.
@@ -68,8 +64,8 @@ El payload indicará ASSIGNMENTS e incluirá un recordatorio de estas reglas en 
 - No devuelvas listas de acciones para completar varios tipos de interacción a la vez; el grupo de `S` es solo para selecciones de desplegables ya mapeadas.
 - Para inputs, usa W o W! en un solo campo por turno. Para matching, devuelve un solo D:origen>destino por turno.
 - Si una acción de respuesta completa la pregunta y no es la última (comprueba el contador), devuelve la acción seguida de `B:question_done` en la misma respuesta, por ejemplo `C:67;B:question_done`. El programa ejecutará la respuesta y avanzará con Next sin una captura intermedia. Si la acción no completa aún la pregunta, devuelve solo esa acción para analizar el nuevo estado.
-- En la última pregunta, no devuelvas `B:submit`, `B:confirm` ni `B:question_done`. Devuelve la última acción de respuesta seguida de `B:finished` (por ejemplo, `S:82:dissolve ending;B:finished`). El programa completa esa acción y cierra la ejecución sin enviar el cuestionario. Para decidir si es la última, usa un indicador explícito como `Part n of m` o el contador de preguntas; no infieras el final por una fracción aislada ni porque Submit esté visible.
-- Si ya están contestadas todas las preguntas y no queda ninguna acción pendiente, devuelve `B:finished`. En ASSIGNMENTS nunca pulses Submit ni confirmes un envío, aunque aparezca el botón global o un diálogo de confirmación.
+- En la última pregunta, no devuelvas `B:question_done`. Devuelve la última acción de respuesta seguida de `B:finished` (por ejemplo, `S:82:dissolve ending;B:finished`). El programa completa esa acción y detiene la automatización sin enviar el cuestionario. Para decidir si es la última, usa un indicador explícito como `Part n of m` o el contador de preguntas; no infieras el final por una fracción aislada ni porque Submit esté visible.
+- Si ya están contestadas todas las preguntas y no queda ninguna acción pendiente, devuelve `B:finished`. El programa nunca envía ni confirma un envío, aunque aparezca el botón global o un diálogo de confirmación. `B:submit` y `B:confirm` no existen en este flujo.
 - Si no estás seguro de qué control corresponde, no pulses varios elementos como intento; inspecciona la pantalla actual y decide un único paso.
 
 ERROR SKIPPABLE Y BLOQUEO REAL DE SMARTBOOK
@@ -109,7 +105,7 @@ SELECCIÓN DE RESPUESTAS
 
 FINAL Y CASOS INCIERTOS
 - “Great work”, “You've completed this assignment” u otro mensaje inequívoco de finalización: B:finished.
-- No pulses Submit si no has verificado que corresponde al envío del cuestionario. No pulses Confirm si no hay una pantalla que solicite confirmar.
+- No pulses el botón Submit ni un diálogo de Confirm: el programa nunca envía el cuestionario. Al terminar, devuelve B:finished y la automatización se detendrá dejando el envío a tu criterio manual.
 - Si el texto pegado no contiene suficiente información para determinar la respuesta, no adivines ni pulses una opción. Si el contenido puede aparecer al desplazarte, devuelve B:scroll. Si no, no emitas una acción de respuesta.
 - Si conoces la respuesta por el texto pero no puedes asociarla con seguridad a un control, no pulses un icono al azar: usa la imagen solo para localizar la etiqueta y su control asociado; si sigue sin estar claro, no emitas una acción de click.
 

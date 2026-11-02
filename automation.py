@@ -45,7 +45,6 @@ coordenadas = {
     'High': None, 'Medium': None, 'Low': None,
     'PEGAR': None, 'ENVIAR': None, 'Next_Question': None,
     'ENFOCAR': None, 'INICIO': None, 'FINAL': None,
-    'QUIZ_SUBMIT': None,
 }
 
 COORDENADAS_BASE = ['PEGAR', 'ENVIAR', 'ENFOCAR', 'Next_Question', 'INICIO', 'FINAL']
@@ -229,16 +228,6 @@ def validar_coordenadas_completas():
         'FINAL', ["Ventana chatbot", "Esquina inf. der. de la respuesta"])
     guardar_coordenadas_json()
 
-    configurar_submit_quiz = input(
-        "¿Quieres guardar la coordenada del botón Submit de los quizzes? (s/n): "
-    ).strip().lower() == 's'
-    if configurar_submit_quiz:
-        coordenadas['QUIZ_SUBMIT'] = capturar_coordenada(
-            'QUIZ_SUBMIT', ["Pantalla del quiz", "Botón Submit de la parte superior"])
-    else:
-        coordenadas['QUIZ_SUBMIT'] = None
-    guardar_coordenadas_json()
-
     print("\n" + "=" * 60)
     print("🎯 RESUMEN:")
     for k, v in coordenadas.items():
@@ -274,18 +263,20 @@ def build_payload(elementos, flujo=None):
             'RECORDATORIO ASSIGNMENTS: Usa el enunciado y las opciones del texto pegado para resolver. '
             'Elige la acción adecuada para el tipo de respuesta (opciones, desplegable, input o arrastre). '
             'Tras completar la pregunta, devuelve B:question_done para avanzar; si es la última, '
-            'devuelve B:finished. No deduzcas que es la última por una fracción aislada; '
-            'usa el indicador Part n of m. No uses Submit ni Confirm. Si un control revela opciones al abrirse, '
+            'devuelve B:finished y el script detendrá la automatización sin enviar el cuestionario. '
+            'No deduzcas que es la última por una fracción aislada; usa el indicador Part n of m. '
+            'B:submit y B:confirm no existen en este flujo. Si un control revela opciones al abrirse, '
             'pide una nueva captura antes de elegir.'
         )
     else:
-        nombre_flujo = ('QUIZ (sin prioridad: responde y pulsa Next; '
-                        'en la última pregunta usa Submit y confirma)')
+        nombre_flujo = ('QUIZ (sin prioridad: responde y el script avanza; '
+                        'al terminar se detiene sin enviar)')
         recordatorio = (
             'RECORDATORIO QUIZ: Resuelve usando el enunciado y el texto de las opciones. '
             'No pulses prioridad ni Next; el script avanza después de responder. '
-            'Reserva Submit para la última pregunta o una pantalla explícita de entrega; '
-            'confirma solo desde una pantalla de confirmación.'
+            'Cuando el contador confirme la última pregunta o aparezca una pantalla de '
+            'finalización, devuelve B:finished: el script detiene la automatización y '
+            'vuelve al menú sin enviar el cuestionario. B:submit y B:confirm no existen.'
         )
     lineas.append(f'MODO DE CUESTIONARIO: {nombre_flujo}')
     lineas.append(recordatorio)
@@ -417,23 +408,13 @@ def procesar_mensaje_chatbot(mensaje):
             acciones.append({'tipo': 'BLOCK_NEXT'}); continue
         if up.startswith('B:SCROLL'):
             acciones.append({'tipo': 'SCROLL'}); continue
-        if up.startswith('B:FINISHED') or up.startswith('B:END'):
+        if (up.startswith('B:FINISHED') or up.startswith('B:END')
+                or up.startswith('B:SUBMIT') or up.startswith('B:CONFIRM')):
+            if up.startswith(('B:SUBMIT', 'B:CONFIRM')):
+                print("ℹ️ B:submit/B:confirm ya no se usan: se interpreta como parada")
             acciones.append({'tipo': 'FINISHED'}); continue
         if up.startswith('B:QUESTION_DONE'):
             acciones.append({'tipo': 'QUESTION_DONE'}); continue
-
-        if up == 'B:SUBMIT' or up.startswith('B:SUBMIT:') or up.startswith('B:CONFIRM:'):
-            tipo = 'SUBMIT' if up.startswith('B:SUBMIT') else 'CONFIRM'
-            partes = bruto.split(':', 2)
-            accion_envio = {'tipo': tipo}
-            if len(partes) == 3:
-                try:
-                    accion_envio['id'] = int(partes[2].strip())
-                except Exception:
-                    print(f"⚠️ Acción de envío inválida: {bruto}")
-                    continue
-            acciones.append(accion_envio)
-            continue
 
         if up.startswith('K:'):
             acciones.append({'tipo': 'K', 'tecla': bruto[2:].strip()}); continue
@@ -556,17 +537,6 @@ def ejecutar_accion_individual(accion):
             pyautogui.hotkey(*p)
         print(f"⌨️ Tecla '{accion['tecla']}'")
 
-    elif tipo in ('SUBMIT', 'CONFIRM'):
-        if tipo == 'SUBMIT' and coordenadas.get('QUIZ_SUBMIT'):
-            pyautogui.click(*coordenadas['QUIZ_SUBMIT'])
-            print(f"📨 Click Submit (coordenada QUIZ_SUBMIT) → {coordenadas['QUIZ_SUBMIT']}")
-        elif accion.get('id') is not None and (el := _elem_por_id(accion['id'])):
-            pyautogui.click(*el['center'])
-            etiqueta = 'Submit' if tipo == 'SUBMIT' else 'confirmación'
-            print(f"📨 Click {etiqueta} id={accion['id']} → {el['content'][:60]}")
-        else:
-            print(f"❌ Falta coordenada QUIZ_SUBMIT o un ID válido para {tipo}")
-
     elif tipo == 'QUESTION_DONE':
         print("✅ El chatbot indica que la pregunta está completa")
 
@@ -596,7 +566,8 @@ def ejecutar_accion_individual(accion):
         pyautogui.click(*coordenadas['Next_Question']); time.sleep(0.1)
 
     elif tipo == 'FINISHED':
-        print("🏁 Asignación completada")
+        print("🏁 Cuestionario terminado: se detiene la automatización y se vuelve "
+              "al menú (no se envía nada)")
         FINISHED_FLAG = True
 
     time.sleep(0.2)
@@ -721,7 +692,57 @@ def validar_respuesta_correcta():
         return True
 
 
+def _progreso_actual():
+    """Progreso visible del cuestionario: (pregunta actual, total).
+
+    Quiz muestra el contador en el pie; Assignments usa 'Part n of m' en
+    cualquier zona de la pantalla. Se consulta primero el indicador propio de
+    cada modo y después el otro, para no confundir 'Part n of m' de una sección
+    con el número de pregunta.
+    """
+    if FLUJO_ACTUAL == 'ASSIGNMENTS':
+        return (_progreso_assignment(ELEMENTOS_ACTUALES)
+                or _contador_preguntas(ELEMENTOS_ACTUALES))
+    return (_contador_preguntas(ELEMENTOS_ACTUALES)
+            or _progreso_assignment(ELEMENTOS_ACTUALES))
+
+
+def _es_ultima_pregunta():
+    """¿El contador visible indica que ya estamos en la última pregunta?"""
+    progreso = _progreso_actual()
+    return bool(progreso and progreso[0] >= progreso[1])
+
+
+def _next_es_submit():
+    """¿El control calibrado como Next_Question muestra 'Submit' ahora?
+
+    En la última pregunta de un quiz el botón de avanzar ocupa el mismo lugar
+    que el de entregar; pulsarlo enviaría el cuestionario.
+    """
+    siguiente = coordenadas.get('Next_Question')
+    if not siguiente:
+        return False
+    sx, sy = siguiente
+    margen = 45
+    for el in ELEMENTOS_ACTUALES:
+        texto = (el.get('content') or '').strip().lower()
+        if not texto.startswith(('submit', 'enviar', 'entregar')):
+            continue
+        x0, y0, x1, y1 = el.get('bbox') or (0, 0, 0, 0)
+        if (x0 - margen <= sx <= x1 + margen
+                and y0 - margen <= sy <= y1 + margen):
+            return True
+    return False
+
+
 def pasar_a_siguiente_pregunta():
+    global FINISHED_FLAG
+    if FLUJO_ACTUAL in ('QUIZ', 'ASSIGNMENTS') and (
+            _es_ultima_pregunta() or _next_es_submit()):
+        FINISHED_FLAG = True
+        print("🏁 Última pregunta del cuestionario: se detiene la automatización "
+              "(no se pulsa Next ni se envía nada).")
+        return
     if coordenadas['Next_Question']:
         pyautogui.click(*coordenadas['ENFOCAR'])
         if SCROLL_ANTES_NEXT:
@@ -751,8 +772,6 @@ def automatizacion_completa():
 
     requeridas = COORDENADAS_BASE + (
         COORDENADAS_PRIORIDAD if FLUJO_ACTUAL == 'SMARTBOOK' else [])
-    if FLUJO_ACTUAL == 'QUIZ':
-        requeridas += ['QUIZ_SUBMIT']
     faltantes = [k for k in requeridas if not coordenadas.get(k)]
     if faltantes:
         print(f"❌ Faltan coordenadas: {', '.join(faltantes)}. Ejecuta validación primero.")
@@ -766,9 +785,7 @@ def automatizacion_completa():
         n = 1
         reintentos_bloqueo = 0
         assignments_omitir_scroll_una_vez = False
-        submit_temprano_bloqueado = False
-        submit_assignments_rechazado = False
-        finished_assignments_rechazado = False
+        finished_prematuro_rechazado = False
 
         while True:
             if FINISHED_FLAG:
@@ -831,31 +848,18 @@ def automatizacion_completa():
 
             # 3. Enviar al chatbot
             payload = build_payload(ELEMENTOS_ACTUALES, FLUJO_ACTUAL)
-            if submit_temprano_bloqueado:
-                contador = _contador_preguntas(ELEMENTOS_ACTUALES)
-                if contador:
-                    payload += (
-                        f"\nCONTROL DEL SCRIPT: el contador indica {contador[0]} de {contador[1]}; "
-                        "no es la última pregunta. No devuelvas B:submit. "
-                        "Si esta pregunta está contestada, devuelve B:question_done."
-                    )
-                submit_temprano_bloqueado = False
-            if submit_assignments_rechazado:
+            if finished_prematuro_rechazado:
+                progreso = _progreso_actual()
                 payload += (
-                    "\nCONTROL DEL SCRIPT: en ASSIGNMENTS no se permite Submit ni Confirm. "
-                    "Si todas las preguntas están contestadas, devuelve B:finished para cerrar el programa."
-                )
-                submit_assignments_rechazado = False
-            if finished_assignments_rechazado:
-                progreso = _progreso_assignment(ELEMENTOS_ACTUALES)
-                payload += (
-                    f"\nCONTROL DEL SCRIPT: todavía estás en Part {progreso[0]} of {progreso[1]}. "
-                    "No devuelvas B:finished; responde la pregunta actual y usa B:question_done para avanzar."
+                    f"\nCONTROL DEL SCRIPT: el contador indica {progreso[0]} de {progreso[1]}. "
+                    "Todavía no es el final: no devuelvas B:finished; responde la pregunta "
+                    "actual y usa B:question_done para avanzar."
                 ) if progreso else (
-                    "\nCONTROL DEL SCRIPT: B:finished fue prematuro. Continúa con las preguntas pendientes; "
-                    "usa B:question_done para avanzar y reserva B:finished para el final real."
+                    "\nCONTROL DEL SCRIPT: B:finished fue prematuro. Continúa con las "
+                    "preguntas pendientes; usa B:question_done para avanzar y reserva "
+                    "B:finished para el final real."
                 )
-                finished_assignments_rechazado = False
+                finished_prematuro_rechazado = False
             if DEBUG:
                 print(f"📤 Payload ({len(payload)} chars):")
                 print(payload[:500] + ("..." if len(payload) > 500 else ""))
@@ -881,41 +885,18 @@ def automatizacion_completa():
                 print("❌ No se pudo parsear")
                 n += 1; continue
 
-            if (FLUJO_ACTUAL == 'ASSIGNMENTS'
-                    and any(a['tipo'] in ('SUBMIT', 'CONFIRM') for a in accion)):
-                print("🛑 Submit/Confirm ignorado: ASSIGNMENTS termina sin enviar el cuestionario.")
-                accion = [a for a in accion if a['tipo'] not in ('SUBMIT', 'CONFIRM')]
-                submit_assignments_rechazado = True
-                if not accion:
-                    n += 1
-                    continue
-
-            if FLUJO_ACTUAL == 'ASSIGNMENTS' and any(
-                    a['tipo'] == 'FINISHED' for a in accion):
-                progreso = _progreso_assignment(ELEMENTOS_ACTUALES)
+            if any(a['tipo'] == 'FINISHED' for a in accion):
+                progreso = _progreso_actual()
                 if progreso and progreso[0] < progreso[1]:
                     print(
-                        f"⚠️ B:finished prematuro: el parser ve Part {progreso[0]} "
-                        f"of {progreso[1]}. Se continuará con la pregunta actual."
+                        f"⚠️ B:finished prematuro: el contador indica {progreso[0]} "
+                        f"de {progreso[1]}. Se continuará con la pregunta actual."
                     )
                     accion = [
                         ({'tipo': 'QUESTION_DONE'} if a['tipo'] == 'FINISHED' else a)
                         for a in accion
                     ]
-                    finished_assignments_rechazado = True
-
-            contador = _contador_preguntas(ELEMENTOS_ACTUALES)
-            if (FLUJO_ACTUAL == 'QUIZ' and contador
-                    and contador[0] < contador[1]
-                    and any(a['tipo'] == 'SUBMIT' for a in accion)):
-                print(
-                    f"🛑 Submit bloqueado: el contador indica {contador[0]} de "
-                    f"{contador[1]}, no la última pregunta.")
-                accion = [a for a in accion if a['tipo'] != 'SUBMIT']
-                submit_temprano_bloqueado = True
-                if not accion:
-                    n += 1
-                    continue
+                    finished_prematuro_rechazado = True
 
             # 5b. Fallback: B:block_read sin C:id → scroll y reintentar (sin avanzar n)
             if (any(a['tipo'] == 'BLOCK_READ' for a in accion) and
@@ -952,7 +933,8 @@ def automatizacion_completa():
                 if acciones_completadas:
                     if accion[-1]['tipo'] == 'FINISHED':
                         FINISHED_FLAG = True
-                        print("🏁 Todas las preguntas están completas; cerrando el programa sin Submit.")
+                        print("🏁 Todas las preguntas están completas; se detiene la "
+                              "automatización sin enviar el cuestionario.")
                         break
                     pasar_a_siguiente_pregunta()
                     n += 1
@@ -1005,11 +987,9 @@ def automatizacion_completa():
                 continue
 
             if FLUJO_ACTUAL == 'QUIZ':
-                # Submit y confirmación ya se ejecutaron por ID detectado. No
-                # pulses Next después: espera la pantalla siguiente y su decisión.
-                if any(a['tipo'] in ('SUBMIT', 'CONFIRM') for a in accion):
-                    n += 1
-                    continue
+                # Un turno equivale a una respuesta: el script avanza con Next.
+                # En la última pregunta pasar_a_siguiente_pregunta() detiene la
+                # automatización en lugar de enviar el cuestionario.
                 pasar_a_siguiente_pregunta()
                 n += 1
                 continue
@@ -1355,7 +1335,7 @@ def main():
         elif op == '2':
             print("\nTipo de cuestionario:")
             print("1. SmartBook (el script elige prioridad y pulsa Next)")
-            print("2. Quiz (Next y Submit al final)")
+            print("2. Quiz (responde y avanza; al final se detiene sin enviar)")
             print("3. Assignments (interacción flexible y reanálisis por turno)")
             tipo_flujo = input("Elige 1, 2 o 3: ").strip()
             if tipo_flujo not in ('1', '2', '3'):
