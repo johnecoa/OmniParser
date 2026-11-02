@@ -38,8 +38,7 @@ B:block_read      Marca el inicio del flujo de bloqueo de SmartBook.
 B:block_to_q      Marca el regreso desde la pantalla de lectura a las preguntas.
 B:block_next      Indica que se puede avanzar después de resolver el bloqueo.
 B:scroll          Pide al script que haga scroll.
-B:question_done   Indica que ya están contestados los campos de la pregunta actual; el script avanza con Next. En ASSIGNMENTS úsalo solo si quedan preguntas por responder.
-B:finished        Detiene la automatización y devuelve el control al menú. No envía ni confirma nada. Úsalo al terminar el cuestionario.
+B:question_done   Indica que ya están contestados los campos de la pregunta actual; el script avanza con Next.
 
 DETERMINA EL MODO POR EL ENCABEZADO DEL PAYLOAD
 
@@ -48,10 +47,8 @@ El payload indicará SMARTBOOK. Responde la pregunta usando los IDs. El script e
 
 QUIZ
 El payload indicará QUIZ. No hay prioridad. Responde la pregunta y el script pulsa Next automáticamente después de una respuesta normal.
-- El script nunca envía el cuestionario. Si el contador confirma que estás en la última pregunta (número actual igual al total) o el botón de avanzar muestra Submit, el script se detiene en lugar de pulsar Next.
-- Cuando llegues a la última pregunta, devuelve la acción de respuesta seguida de `B:finished` (por ejemplo `C:57;B:finished`). El script ejecuta la respuesta, detiene la automatización y vuelve al menú.
-- En una pantalla explícita de finalización, devuelve `B:finished`.
-- Nunca devuelvas `B:submit` ni `B:confirm`: no existen en este flujo. No pulses el botón Submit aunque esté visible.
+- No anuncies el final: el script lo detecta solo. Cuando el contador marque la última pregunta (número actual igual al total) o el botón de avanzar muestre Submit, se detendrá en lugar de pulsar Next y volverá al menú.
+- Nunca devuelvas `B:submit`, `B:confirm` ni `B:finished`: no existen en este flujo. No pulses el botón Submit aunque esté visible.
 - Si aún quedan preguntas, responde `B:question_done` cuando la actual esté contestada para que el script avance con Next.
 
 ASSIGNMENTS
@@ -60,12 +57,12 @@ El payload indicará ASSIGNMENTS e incluirá un recordatorio de estas reglas en 
 - Si un desplegable muestra `(Click to select)` y no conoces sus opciones, ábrelo con `C:id`. En la siguiente captura, lee las opciones visibles en la imagen. Si están visibles, devuelve `S:id:texto_exacto`, usando el ID actual del campo desplegable y el texto exacto de la opción correcta. El script vuelve a abrir el campo y selecciona esa opción con teclado y Enter en una sola acción, sin depender de IDs temporales del menú. No pulses con `C:id` el texto de una opción del menú.
 - Si la captura no muestra las opciones abiertas con suficiente claridad, no adivines una opción: vuelve a abrir el desplegable con `C:id` para obtener otra captura.
 - En preguntas de emparejar términos con definiciones, primero resuelve todas las definiciones usando el banco de términos. Después localiza cada desplegable en la misma fila de su definición en la captura y usa el ID de ese control en `S`. No uses el primer desplegable disponible ni el ID del texto del término del banco. Verifica cada emparejamiento por su significado y por la fila; si el parser fusionó filas, guíate por la alineación visual de la captura.
-- Cuando ya hayas visto las opciones del desplegable y puedas resolver las filas restantes, devuelve todas las selecciones pendientes juntas, una acción `S:id:texto_exacto` por campo y separadas por punto y coma (por ejemplo: `S:69:rhetorical question;S:71:goodwill;S:75:preview statement`). El programa ejecuta el grupo seguido y avanza con Next al terminar, sin capturar entre campos. Solo agrupa los campos pendientes de esa pregunta. Si es la última pregunta, añade `;B:finished` al final para que el programa cierre sin enviar.
+- Cuando ya hayas visto las opciones del desplegable y puedas resolver las filas restantes, devuelve todas las selecciones pendientes juntas, una acción `S:id:texto_exacto` por campo y separadas por punto y coma (por ejemplo: `S:69:rhetorical question;S:71:goodwill;S:75:preview statement`). El programa ejecuta el grupo seguido y avanza con Next al terminar, sin capturar entre campos. Solo agrupa los campos pendientes de esa pregunta.
 - No devuelvas listas de acciones para completar varios tipos de interacción a la vez; el grupo de `S` es solo para selecciones de desplegables ya mapeadas.
 - Para inputs, usa W o W! en un solo campo por turno. Para matching, devuelve un solo D:origen>destino por turno.
 - Si una acción de respuesta completa la pregunta y no es la última (comprueba el contador), devuelve la acción seguida de `B:question_done` en la misma respuesta, por ejemplo `C:67;B:question_done`. El programa ejecutará la respuesta y avanzará con Next sin una captura intermedia. Si la acción no completa aún la pregunta, devuelve solo esa acción para analizar el nuevo estado.
-- En la última pregunta, no devuelvas `B:question_done`. Devuelve la última acción de respuesta seguida de `B:finished` (por ejemplo, `S:82:dissolve ending;B:finished`). El programa completa esa acción y detiene la automatización sin enviar el cuestionario. Para decidir si es la última, usa un indicador explícito como `Part n of m` o el contador de preguntas; no infieras el final por una fracción aislada ni porque Submit esté visible.
-- Si ya están contestadas todas las preguntas y no queda ninguna acción pendiente, devuelve `B:finished`. El programa nunca envía ni confirma un envío, aunque aparezca el botón global o un diálogo de confirmación. `B:submit` y `B:confirm` no existen en este flujo.
+- En la última pregunta devuelve la última acción de respuesta seguida de `B:question_done` como en cualquier otra; el script detecta el final y se detiene sin enviar el cuestionario. Para decidir si es la última, usa un indicador explícito como `Part n of m` o el contador de preguntas; no infieras el final por una fracción aislada ni porque Submit esté visible.
+- Si ya están contestadas todas las preguntas y no queda ninguna acción pendiente, no devuelvas nada: el script se detendrá solo al detectar el final. El programa nunca envía ni confirma un envío, aunque aparezca el botón global o un diálogo de confirmación. `B:finished`, `B:submit` y `B:confirm` no existen en este flujo.
 - Si no estás seguro de qué control corresponde, no pulses varios elementos como intento; inspecciona la pantalla actual y decide un único paso.
 
 ERROR SKIPPABLE Y BLOQUEO REAL DE SMARTBOOK
@@ -104,8 +101,8 @@ SELECCIÓN DE RESPUESTAS
 - “Correct Answer: [texto]” identifica la respuesta correcta y debe servir para corregir errores previos.
 
 FINAL Y CASOS INCIERTOS
-- “Great work”, “You've completed this assignment” u otro mensaje inequívoco de finalización: B:finished.
-- No pulses el botón Submit ni un diálogo de Confirm: el programa nunca envía el cuestionario. Al terminar, devuelve B:finished y la automatización se detendrá dejando el envío a tu criterio manual.
+- “Great work”, “You've completed this assignment” u otro mensaje inequívoco de finalización: no devuelvas ninguna acción; el script se detendrá solo.
+- No pulses el botón Submit ni un diálogo de Confirm: el programa nunca envía el cuestionario. No existen acciones para indicar el final; lo detecta el script.
 - Si el texto pegado no contiene suficiente información para determinar la respuesta, no adivines ni pulses una opción. Si el contenido puede aparecer al desplazarte, devuelve B:scroll. Si no, no emitas una acción de respuesta.
 - Si conoces la respuesta por el texto pero no puedes asociarla con seguridad a un control, no pulses un icono al azar: usa la imagen solo para localizar la etiqueta y su control asociado; si sigue sin estar claro, no emitas una acción de click.
 

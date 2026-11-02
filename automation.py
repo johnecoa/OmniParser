@@ -262,10 +262,9 @@ def build_payload(elementos, flujo=None):
         recordatorio = (
             'RECORDATORIO ASSIGNMENTS: Usa el enunciado y las opciones del texto pegado para resolver. '
             'Elige la acción adecuada para el tipo de respuesta (opciones, desplegable, input o arrastre). '
-            'Tras completar la pregunta, devuelve B:question_done para avanzar; si es la última, '
-            'devuelve B:finished y el script detendrá la automatización sin enviar el cuestionario. '
-            'No deduzcas que es la última por una fracción aislada; usa el indicador Part n of m. '
-            'B:submit y B:confirm no existen en este flujo. Si un control revela opciones al abrirse, '
+            'Tras completar la pregunta, devuelve B:question_done para avanzar. '
+            'El script detecta el final con el indicador Part n of m y se detiene sin enviar el cuestionario: '
+            'no devuelvas B:finished, B:submit ni B:confirm. Si un control revela opciones al abrirse, '
             'pide una nueva captura antes de elegir.'
         )
     else:
@@ -274,9 +273,8 @@ def build_payload(elementos, flujo=None):
         recordatorio = (
             'RECORDATORIO QUIZ: Resuelve usando el enunciado y el texto de las opciones. '
             'No pulses prioridad ni Next; el script avanza después de responder. '
-            'Cuando el contador confirme la última pregunta o aparezca una pantalla de '
-            'finalización, devuelve B:finished: el script detiene la automatización y '
-            'vuelve al menú sin enviar el cuestionario. B:submit y B:confirm no existen.'
+            'El script detecta el final por el contador o por el botón Submit y se detiene '
+            'sin enviar el cuestionario: no devuelvas B:finished, B:submit ni B:confirm.'
         )
     lineas.append(f'MODO DE CUESTIONARIO: {nombre_flujo}')
     lineas.append(recordatorio)
@@ -408,11 +406,12 @@ def procesar_mensaje_chatbot(mensaje):
             acciones.append({'tipo': 'BLOCK_NEXT'}); continue
         if up.startswith('B:SCROLL'):
             acciones.append({'tipo': 'SCROLL'}); continue
-        if (up.startswith('B:FINISHED') or up.startswith('B:END')
-                or up.startswith('B:SUBMIT') or up.startswith('B:CONFIRM')):
-            if up.startswith(('B:SUBMIT', 'B:CONFIRM')):
-                print("ℹ️ B:submit/B:confirm ya no se usan: se interpreta como parada")
-            acciones.append({'tipo': 'FINISHED'}); continue
+        if up.startswith('B:FINISHED') or up.startswith('B:END'):
+            print("ℹ️ B:finished/B:end ignorado: el final del cuestionario lo decide el programa")
+            continue
+        if up.startswith(('B:SUBMIT', 'B:CONFIRM')):
+            print("ℹ️ B:submit/B:confirm ignorados: el programa nunca envía el cuestionario")
+            continue
         if up.startswith('B:QUESTION_DONE'):
             acciones.append({'tipo': 'QUESTION_DONE'}); continue
 
@@ -480,7 +479,6 @@ def ejecutar_accion_automatica(accion):
 
 
 def ejecutar_accion_individual(accion):
-    global FINISHED_FLAG
     tipo = accion['tipo']
 
     if tipo == 'C':
@@ -564,11 +562,6 @@ def ejecutar_accion_individual(accion):
         if SCROLL_ANTES_NEXT:
             pyautogui.scroll(-3000); time.sleep(0.1)
         pyautogui.click(*coordenadas['Next_Question']); time.sleep(0.1)
-
-    elif tipo == 'FINISHED':
-        print("🏁 Cuestionario terminado: se detiene la automatización y se vuelve "
-              "al menú (no se envía nada)")
-        FINISHED_FLAG = True
 
     time.sleep(0.2)
 
@@ -713,6 +706,18 @@ def _es_ultima_pregunta():
     return bool(progreso and progreso[0] >= progreso[1])
 
 
+def _pantalla_final(elementos):
+    """¿La pantalla muestra un mensaje de cuestionario completado?"""
+    frases = ('great work', "you've completed", 'you have completed',
+              'completed this assignment', 'completed this quiz',
+              'all questions answered')
+    texto = ' '.join(
+        (el.get('content') or '').lower()
+        for el in elementos if el.get('type') == 'text'
+    )
+    return any(frase in texto for frase in frases)
+
+
 def _next_es_submit():
     """¿El control calibrado como Next_Question muestra 'Submit' ahora?
 
@@ -785,7 +790,6 @@ def automatizacion_completa():
         n = 1
         reintentos_bloqueo = 0
         assignments_omitir_scroll_una_vez = False
-        finished_prematuro_rechazado = False
 
         while True:
             if FINISHED_FLAG:
@@ -846,20 +850,16 @@ def automatizacion_completa():
                     continue
                 print(f"   📋 {len(ELEMENTOS_ACTUALES)} elementos tras scroll")
 
+            # 2c. Pantalla de cuestionario completado → parar sin enviar nada
+            if (FLUJO_ACTUAL in ('QUIZ', 'ASSIGNMENTS')
+                    and _pantalla_final(ELEMENTOS_ACTUALES)):
+                FINISHED_FLAG = True
+                print("🏁 La pantalla indica que el cuestionario está completo: "
+                      "se detiene la automatización sin enviar nada.")
+                break
+
             # 3. Enviar al chatbot
             payload = build_payload(ELEMENTOS_ACTUALES, FLUJO_ACTUAL)
-            if finished_prematuro_rechazado:
-                progreso = _progreso_actual()
-                payload += (
-                    f"\nCONTROL DEL SCRIPT: el contador indica {progreso[0]} de {progreso[1]}. "
-                    "Todavía no es el final: no devuelvas B:finished; responde la pregunta "
-                    "actual y usa B:question_done para avanzar."
-                ) if progreso else (
-                    "\nCONTROL DEL SCRIPT: B:finished fue prematuro. Continúa con las "
-                    "preguntas pendientes; usa B:question_done para avanzar y reserva "
-                    "B:finished para el final real."
-                )
-                finished_prematuro_rechazado = False
             if DEBUG:
                 print(f"📤 Payload ({len(payload)} chars):")
                 print(payload[:500] + ("..." if len(payload) > 500 else ""))
@@ -885,19 +885,6 @@ def automatizacion_completa():
                 print("❌ No se pudo parsear")
                 n += 1; continue
 
-            if any(a['tipo'] == 'FINISHED' for a in accion):
-                progreso = _progreso_actual()
-                if progreso and progreso[0] < progreso[1]:
-                    print(
-                        f"⚠️ B:finished prematuro: el contador indica {progreso[0]} "
-                        f"de {progreso[1]}. Se continuará con la pregunta actual."
-                    )
-                    accion = [
-                        ({'tipo': 'QUESTION_DONE'} if a['tipo'] == 'FINISHED' else a)
-                        for a in accion
-                    ]
-                    finished_prematuro_rechazado = True
-
             # 5b. Fallback: B:block_read sin C:id → scroll y reintentar (sin avanzar n)
             if (any(a['tipo'] == 'BLOCK_READ' for a in accion) and
                     not any(a['tipo'] == 'C' for a in accion) and
@@ -920,7 +907,7 @@ def automatizacion_completa():
                     acciones_completadas = True
                 # También admite una respuesta seguida de B:question_done,
                 # por ejemplo C:67;B:question_done, como una secuencia única.
-                elif (accion[-1]['tipo'] in ('QUESTION_DONE', 'FINISHED')
+                elif (accion[-1]['tipo'] == 'QUESTION_DONE'
                       and len(accion) > 1
                       and all(a['tipo'] in ('C', 'SELECT_OPTION', 'W', 'D')
                               for a in accion[:-1])):
@@ -931,11 +918,6 @@ def automatizacion_completa():
                     acciones_completadas = False
 
                 if acciones_completadas:
-                    if accion[-1]['tipo'] == 'FINISHED':
-                        FINISHED_FLAG = True
-                        print("🏁 Todas las preguntas están completas; se detiene la "
-                              "automatización sin enviar el cuestionario.")
-                        break
                     pasar_a_siguiente_pregunta()
                     n += 1
                     continue
